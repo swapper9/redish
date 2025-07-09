@@ -1,14 +1,14 @@
 [package]
 name = "redish"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 authors = ["Swapper9 <swapper9@gmail.com>"]
 description = "A lightweight in-memory key-value database"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/swapper9/Redish"
-#documentation = "https://docs.rs
-#homepage = "https://docs.rs/
+repository = "https://github.com/swapper9/redish"
+documentation = "https://docs.rs/redish"
+homepage = "https://github.com/swapper9/redish"
 keywords = ["database", "key-value", "in-memory", "persistence", "indexing"]
 categories = ["database", "caching"]
 
