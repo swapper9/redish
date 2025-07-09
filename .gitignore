@@ -1,0 +1,10 @@
+/target
+/logs
+/.idea/
+/Cargo.lock
+/*.bin
+/*.json
+/*.db
+/*.sst
+/*.log
+/*.idx

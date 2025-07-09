@@ -1,0 +1,53 @@
+[package]
+name = "redish"
+version = "0.1.0"
+edition = "2024"
+authors = ["Swapper9 <swapper9@gmail.com>"]
+description = "A lightweight in-memory key-value database"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/swapper9/Redish"
+#documentation = "https://docs.rs
+#homepage = "https://docs.rs/
+keywords = ["database", "key-value", "in-memory", "persistence", "indexing"]
+categories = ["database", "caching"]
+
+[profile.release]
+opt-level = 3             
+lto = true
+codegen-units = 1
+strip = true
+#debug = true
+
+[lib]
+name = "redish"
+path = "src/lib.rs"
+
+[dependencies]
+bincode = "2.0.1"
+log = "0.4"
+log4rs = { version ="1.3.0", features = ["gzip"] }
+once_cell = "1.21.3"
+rand = "0.9.1"
+serial_test = "3.2.0"
+crc32fast = "1.4.2"
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+
+[profile.bench]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[[bench]]
+name = "tree_benchmarks"
+harness = false
+
+[[bench]]
+name = "serialization_benchmarks"
+harness = false
+
+[[bench]]
+name = "memory_benchmarks"
+harness = false
