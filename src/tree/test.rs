@@ -36,6 +36,7 @@ mod test {
             db_path: Default::default(),
             bincode_config: Default::default(),
             mem_table_max_size: 1000,
+            enable_index_cache: false,
         });
         let tree2 = Tree::load_with_settings(TreeSettings::default());
         let tree3 = Tree::load_with_settings(
@@ -107,7 +108,7 @@ mod test {
         println!("tree.mem_table.len: {}", tree.mem_table.len());
         println!("tree.immutable_mem_tables.len: {}", tree.immutable_mem_tables.len());
         println!("tree.ss_tables.len: {}", tree.ss_tables.len());
-
+        println!("{:?}", tree.get_cache_stats());
         let flush_start = std::time::Instant::now();
         tree.flush();
         let flush_duration = flush_start.elapsed();
@@ -120,7 +121,7 @@ mod test {
 
         use rand::Rng;
         let mut rng = rand::rng();
-        let random_indices: Vec<u64> = (0..100)
+        let random_indices: Vec<u64> = (0..1000)
             .map(|_| rng.random_range(1..=max_entries))
             .collect();
 
@@ -139,12 +140,10 @@ mod test {
                  random_indices.len(), normal_search_duration);
         println!("Found through get_typed: {}/{}", found_normal, random_indices.len());
 
-        // Проверяем конкретные записи
         let test_indices = [1, 1000, 5000, 7500, 10000];
         for &index in &test_indices {
             let key = format!("flush_test_user_{}", index);
 
-            // Проверяем через get_typed
             let user = tree.get_typed::<User>(key.as_str());
             assert!(user.is_some(), "User {} not found", key);
 
@@ -165,7 +164,7 @@ mod test {
                  max_entries as f64 / flush_duration.as_millis() as f64);
         println!("Search speed through get_typed (random): {:.2} searches/ms",
                  random_indices.len() as f64 / normal_search_duration.as_millis() as f64);
-
+        println!("{:?}", tree.get_cache_stats());
         clean_temp_dir();
     }
 }

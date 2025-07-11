@@ -1,13 +1,17 @@
 #[cfg(test)]
 mod test;
 
-use crate::config::{BINCODE_CONFIG, CURRENT_VERSION, DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE, FOOTER_MAGIC_NUMBER, FOOTER_SIZE, HEADER_MAGIC_NUMBER};
+use crate::config::{
+    BINCODE_CONFIG, CURRENT_VERSION, DEFAULT_DB_PATH, DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY,
+    DEFAULT_INDEX_CACHE_MEMORY_LIMIT, DEFAULT_MEM_TABLE_SIZE, FOOTER_MAGIC_NUMBER, FOOTER_SIZE,
+    HEADER_MAGIC_NUMBER,
+};
 use crate::{logger, util};
 use bincode::{Decode, Encode};
 use crc32fast::Hasher;
 use log::{debug, error, warn};
 use once_cell::sync::Lazy;
-use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -99,11 +103,198 @@ impl DataValue {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub size: usize,
+    pub hit_count: u64,
+    pub miss_count: u64,
+    pub eviction_count: u64,
+    pub hit_rate: f64,
+    pub memory_limit: usize,
+    pub memory_utilization: f64,
+}
+
+pub struct LRUIndexCache {
+    cache: HashMap<PathBuf, BTreeMap<Vec<u8>, u64>>,
+    lru_queue: VecDeque<PathBuf>,
+    max_capacity: usize,
+    memory_limit: usize,
+    current_memory_usage: usize,
+    hit_count: u64,
+    miss_count: u64,
+    eviction_count: u64,
+}
+
+impl Default for LRUIndexCache {
+    fn default() -> Self {
+        Self {
+            cache: HashMap::new(),
+            lru_queue: VecDeque::new(),
+            max_capacity: DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY,
+            memory_limit: DEFAULT_INDEX_CACHE_MEMORY_LIMIT,
+            current_memory_usage: 0,
+            hit_count: 0,
+            miss_count: 0,
+            eviction_count: 0,
+        }
+    }
+}
+
+impl LRUIndexCache {
+    pub fn new(max_capacity: usize, memory_limit: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            lru_queue: VecDeque::new(),
+            max_capacity,
+            memory_limit,
+            current_memory_usage: 0,
+            hit_count: 0,
+            miss_count: 0,
+            eviction_count: 0,
+        }
+    }
+
+    pub fn get(&mut self, path: &PathBuf) -> Option<&BTreeMap<Vec<u8>, u64>> {
+        if self.cache.contains_key(path) {
+            self.hit_count += 1;
+            self.move_to_back(path);
+            self.cache.get(path)
+        } else {
+            self.miss_count += 1;
+            None
+        }
+    }
+
+    pub fn put(&mut self, path: PathBuf, index: BTreeMap<Vec<u8>, u64>) {
+        let index_size = self.estimate_index_size(&index);
+
+        if self.cache.contains_key(&path) {
+            let old_size = self.estimate_index_size(self.cache.get(&path).unwrap());
+            self.current_memory_usage = self.current_memory_usage.saturating_sub(old_size);
+            self.cache.insert(path.clone(), index);
+            self.current_memory_usage += index_size;
+            self.move_to_back(&path);
+            return;
+        }
+
+        while (self.cache.len() >= self.max_capacity)
+            || (self.current_memory_usage + index_size > self.memory_limit)
+        {
+            if !self.evict_lru() {
+                break;
+            }
+        }
+
+        self.cache.insert(path.clone(), index);
+        self.lru_queue.push_back(path);
+        self.current_memory_usage += index_size;
+    }
+
+    pub fn remove(&mut self, path: &PathBuf) {
+        if self.cache.contains_key(path) {
+            self.cache.remove(path);
+        }
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            size: self.cache.len(),
+            hit_count: self.hit_count,
+            miss_count: self.miss_count,
+            eviction_count: self.eviction_count,
+            hit_rate: if self.hit_count + self.miss_count > 0 {
+                self.hit_count as f64 / (self.hit_count + self.miss_count) as f64
+            } else {
+                0.0
+            },
+            memory_limit: self.memory_limit,
+            memory_utilization: self.current_memory_usage as f64 / self.memory_limit as f64,
+        }
+    }
+
+    fn move_to_back(&mut self, path: &PathBuf) {
+        self.lru_queue.retain(|p| p != path);
+        self.lru_queue.push_back(path.clone());
+    }
+
+    fn evict_lru(&mut self) -> bool {
+        if let Some(path) = self.lru_queue.pop_front() {
+            if let Some(index) = self.cache.remove(&path) {
+                let index_size = self.estimate_index_size(&index);
+                self.current_memory_usage = self.current_memory_usage.saturating_sub(index_size);
+                self.eviction_count += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn estimate_index_size(&self, index: &BTreeMap<Vec<u8>, u64>) -> usize {
+        let mut size = 0;
+        for (key, _) in index {
+            size += key.len() + 8;
+            size += key.capacity();
+            size += size_of::<Vec<u8>>();
+        }
+        size += index.len() * 28;
+        size += size_of::<BTreeMap<Vec<u8>, u64>>();
+        size
+    }
+
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    pub fn cached_paths(&self) -> Vec<PathBuf> {
+        self.cache.keys().cloned().collect()
+    }
+
+    pub fn evict_n(&mut self, n: usize) -> usize {
+        let mut evicted = 0;
+        for _ in 0..n {
+            if self.evict_lru() {
+                evicted += 1;
+            } else {
+                break;
+            }
+        }
+        evicted
+    }
+
+    pub fn resize(&mut self, new_capacity: usize, new_memory_limit: usize) {
+        self.max_capacity = new_capacity;
+        self.memory_limit = new_memory_limit;
+
+        while (self.cache.len() > self.max_capacity)
+            || (self.current_memory_usage > self.memory_limit)
+        {
+            if !self.evict_lru() {
+                break;
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.cache.clear();
+        self.lru_queue.clear();
+        self.current_memory_usage = 0;
+    }
+
+    pub fn contains_key(&mut self, key: &PathBuf) -> bool {
+        self.get(key).is_some()
+    }
+}
+
 #[derive(Clone)]
 pub struct TreeSettings {
     db_path: PathBuf,
     bincode_config: bincode::config::Configuration,
     mem_table_max_size: usize,
+    enable_index_cache: bool,
 }
 
 impl Default for TreeSettings {
@@ -112,6 +303,7 @@ impl Default for TreeSettings {
             db_path: PathBuf::from(DEFAULT_DB_PATH),
             bincode_config: BINCODE_CONFIG,
             mem_table_max_size: DEFAULT_MEM_TABLE_SIZE as usize,
+            enable_index_cache: true,
         }
     }
 }
@@ -225,32 +417,24 @@ impl TreeSettingsBuilder {
     /// A new TreeSettings instance
     pub fn build(self) -> TreeSettings {
         TreeSettings {
-            db_path: self.db_path.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
+            db_path: self
+                .db_path
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
             bincode_config: self.bincode_config.unwrap_or(BINCODE_CONFIG),
-            mem_table_max_size: self.mem_table_max_size.unwrap_or(DEFAULT_MEM_TABLE_SIZE as usize),
+            mem_table_max_size: self
+                .mem_table_max_size
+                .unwrap_or(DEFAULT_MEM_TABLE_SIZE as usize),
+            enable_index_cache: true,
         }
     }
 }
 
-// Структура SSTable Header {
-//     magic: [u8; 4],        // "SSTB" - magic number
-//     version: u32,          // версия формата
-//     compression: u8,       // тип сжатия (0 = нет, 1 = lz4, 2 = zstd)
-//     checksum_type: u8,     // тип чексуммы (0 = нет, 1 = crc32)
-//     reserved: [u8; 6],     // резерв для будущих расширений
-// }
-
-// SSTable structure:
-// [Header: 16 bytes] [Data Blocks] [Index Block] [Footer]
-// [Data Block] :
-// [key_len: u32] [key: Vec<u8>] [data_len: u32] [data: Vec<u8>] [checksum: u32]
-// Index: [index_num_entries: u32] [index_key_len: u32] [index_key: Vec<u8>] [offset_to_data_entry: u64]
-// Footer: [index_offset: u64] [footer_magic: u32]
 pub struct Tree {
     mem_table: BTreeMap<Vec<u8>, DataValue>,
     immutable_mem_tables: VecDeque<BTreeMap<Vec<u8>, DataValue>>,
     ss_tables: Vec<PathBuf>,
     settings: TreeSettings,
+    index_cache: LRUIndexCache,
 }
 
 impl Drop for Tree {
@@ -269,11 +453,13 @@ impl Tree {
     pub fn new() -> Self {
         Lazy::force(&INIT);
         util::logo();
+
         Self {
             mem_table: BTreeMap::new(),
             immutable_mem_tables: VecDeque::new(),
             ss_tables: Vec::new(),
             settings: TreeSettings::default(),
+            index_cache: LRUIndexCache::default(),
         }
     }
 
@@ -293,7 +479,8 @@ impl Tree {
             settings: TreeSettings {
                 db_path: PathBuf::from(path),
                 ..TreeSettings::default()
-            }
+            },
+            index_cache: LRUIndexCache::default(),
         }
     }
 
@@ -311,7 +498,16 @@ impl Tree {
             immutable_mem_tables: VecDeque::new(),
             ss_tables: Vec::new(),
             settings,
+            index_cache: LRUIndexCache::default(),
         }
+    }
+
+    pub fn get_cache_stats(&self) -> CacheStats {
+        self.index_cache.stats()
+    }
+
+    pub fn clear_index_cache(&mut self) {
+        self.index_cache.clear();
     }
 
     /// Creates and loads a Tree from the default database path.
@@ -362,7 +558,7 @@ impl Tree {
             self.settings.db_path.clone()
         };
         if !db_path.exists() {
-            debug!("Database folder not exist, creating: {:?}",db_path);
+            debug!("Database folder not exist, creating: {:?}", db_path);
             if let Err(e) = std::fs::create_dir_all(&db_path) {
                 panic!("Error creating folder for database: {}", e);
             }
@@ -404,7 +600,7 @@ impl Tree {
                         .and_then(|name| name.to_str())
                         .and_then(|name| {
                             if name.starts_with("sstable_") && name.ends_with(".sst") {
-                                name[8..name.len()-4].parse::<u64>().ok()
+                                name[8..name.len() - 4].parse::<u64>().ok()
                             } else {
                                 None
                             }
@@ -499,7 +695,7 @@ impl Tree {
         let key_bytes = key.as_bytes().to_vec();
         match bincode::encode_to_vec(value, self.settings.bincode_config) {
             Ok(serialized) => self.put_with_ttl(key_bytes, serialized, ttl),
-            Err(e) => log::error!("Error serializing value for key '{}': {}", key, e)
+            Err(e) => log::error!("Error serializing value for key '{}': {}", key, e),
         }
     }
 
@@ -549,7 +745,7 @@ impl Tree {
     ///
     /// # Returns
     /// `Some(T)` if the key exists and can be deserialized, `None` otherwise
-    pub fn get_typed<T>(&self, key: &str) -> Option<T>
+    pub fn get_typed<T>(&mut self, key: &str) -> Option<T>
     where
         T: bincode::Decode<()>,
     {
@@ -594,7 +790,7 @@ impl Tree {
     /// # See Also
     /// - [`get_typed`] - For retrieving a single typed value
     /// - [`get_vec`] - For retrieving multiple raw byte values
-    pub fn get_vec_typed<T>(&self, keys: Vec<&str>) -> Vec<Option<T>>
+    pub fn multi_get_typed<T>(&mut self, keys: Vec<&str>) -> Vec<Option<T>>
     where
         T: bincode::Decode<()>,
     {
@@ -615,12 +811,9 @@ impl Tree {
     /// A `Vec<Option<Vec<u8>>>` where each element corresponds to the key at the
     /// same index in the input vector. `Some(Vec<u8>)` if the key exists and is valid,
     /// `None` otherwise.
-    pub fn get_vec(&self, keys: Vec<&[u8]>) -> Vec<Option<Vec<u8>>> {
-        keys.into_iter()
-            .map(|key| self.get(key))
-            .collect()
+    pub fn multi_get(&mut self, keys: Vec<&[u8]>) -> Vec<Option<Vec<u8>>> {
+        keys.into_iter().map(|key| self.get(key)).collect()
     }
-
 
     /// Retrieves raw bytes from the tree.
     ///
@@ -632,7 +825,7 @@ impl Tree {
     ///
     /// # Returns
     /// `Some(Vec<u8>)` if the key exists and is valid, `None` otherwise
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(value) = self.mem_table.get(key) {
             if !value.is_expired() {
                 return Some(value.get_data().to_vec());
@@ -647,7 +840,8 @@ impl Tree {
             }
         }
 
-        for sst_path in self.ss_tables.iter().rev() {
+        let ss_tables = self.ss_tables.clone();
+        for sst_path in ss_tables.iter().rev() {
             if let Some(value) = self.read_key_from_ss_table(sst_path, key) {
                 if !value.is_expired() {
                     return Some(value.get_data().to_vec());
@@ -757,7 +951,7 @@ impl Tree {
     ///
     /// # Returns
     /// `true` if the key exists and is valid, `false` otherwise
-    pub fn contains_key(&self, key: &[u8]) -> bool {
+    pub fn contains_key(&mut self, key: &[u8]) -> bool {
         self.get(key).is_some()
     }
 
@@ -778,8 +972,7 @@ impl Tree {
         let immutable_count: usize = self
             .immutable_mem_tables
             .iter()
-            .map(|table| table.values()
-                .filter(|value| !value.is_expired()).count())
+            .map(|table| table.values().filter(|value| !value.is_expired()).count())
             .sum();
 
         let ss_table_count: usize = self
@@ -787,8 +980,10 @@ impl Tree {
             .iter()
             .map(|table_path| {
                 let table = self.load_ss_table(table_path);
-                table.values()
-                    .filter(|value| !value.is_expired() || !value.is_tombstone()).count()
+                table
+                    .values()
+                    .filter(|value| !value.is_expired() || !value.is_tombstone())
+                    .count()
             })
             .sum();
 
@@ -864,8 +1059,6 @@ impl Tree {
 
         let new_ss_table_path = self.write_ss_table(&immutable_table);
         self.ss_tables.push(new_ss_table_path.clone());
-        debug!("Compacted immutable mem table to SSTable: {:?}", new_ss_table_path);
-        debug!("Current SSTables: {:?}", self.ss_tables);
 
         if self.ss_tables.len() > 2 {
             self.merge_ss_tables();
@@ -914,48 +1107,42 @@ impl Tree {
         table
     }
 
-    fn write_ss_table(&self, table: &BTreeMap<Vec<u8>, DataValue>) -> PathBuf {
+    fn write_ss_table(&mut self, table: &BTreeMap<Vec<u8>, DataValue>) -> PathBuf {
         let new_ss_table_number = match util::find_last_ss_table_number(&self.settings.db_path) {
             None => 0,
             Some(number) => number + 1,
         };
-        let table_path = self.settings.db_path
+        let table_path = self
+            .settings
+            .db_path
             .join(format!("sstable_{}.sst", new_ss_table_number));
         let file = File::create(&table_path).unwrap();
         let mut writer = BufWriter::new(file);
 
         self.write_header(&mut writer).unwrap();
 
-        //let data_start = writer.stream_position().unwrap();
         let mut index = BTreeMap::new();
-        //let mut bloom_keys = Vec::new();
-        //let mut bloom_filter: BloomFilter = BloomFilter::with_rate(0.01, DEFAULT_MEM_TABLE_SIZE);
 
         for (key, value) in table {
             let offset = writer.stream_position().unwrap();
             self.write_data_entry(&mut writer, key, value).unwrap();
 
             index.insert(key.clone(), offset);
-            //bloom_keys.push(key.clone());
         }
 
-        // 3. Записываем индекс
         let index_offset = writer.stream_position().unwrap();
         self.write_index(&mut writer, &index).unwrap();
 
-        //let bloom_offset = writer.stream_position().unwrap();
-        //self.write_bloom_filter(&mut writer, &bloom_filter).unwrap();
-
-        //self.write_footer(&mut writer, index_offset, bloom_offset).unwrap();
         self.write_footer(&mut writer, index_offset).unwrap();
 
         writer.flush().unwrap();
+        self.index_cache.put(table_path.clone(), index);
         table_path
     }
 
     fn write_header(&self, writer: &mut BufWriter<File>) -> std::io::Result<()> {
-        writer.write_all(HEADER_MAGIC_NUMBER)?; // magic
-        writer.write_all(&CURRENT_VERSION.to_le_bytes())?; // version
+        writer.write_all(HEADER_MAGIC_NUMBER)?;
+        writer.write_all(&CURRENT_VERSION.to_le_bytes())?;
         writer.write_all(&[0u8; 8])?; // compression, checksum_type, reserved
         Ok(())
     }
@@ -1004,8 +1191,6 @@ impl Tree {
         Ok(())
     }
 
-    //TODO:  Incremental Compaction, Parallel Compaction
-
     fn merge_ss_tables(&mut self) {
         let tables_to_merge_count = std::cmp::min(self.ss_tables.len(), 3);
         if tables_to_merge_count < 2 {
@@ -1014,7 +1199,6 @@ impl Tree {
 
         let tables_to_merge: Vec<PathBuf> =
             self.ss_tables.drain(0..tables_to_merge_count).collect();
-        debug!("Merging SSTables: {:?}", tables_to_merge);
 
         let mut table_data: Vec<BTreeMap<Vec<u8>, DataValue>> =
             Vec::with_capacity(tables_to_merge.len());
@@ -1022,9 +1206,7 @@ impl Tree {
             table_data.push(self.load_ss_table(table_path));
         }
 
-        let mut iterators: Vec<_> = table_data.iter()
-            .map(|table| table.iter())
-            .collect();
+        let mut iterators: Vec<_> = table_data.iter().map(|table| table.iter()).collect();
 
         let mut min_heap = BinaryHeap::new();
 
@@ -1076,6 +1258,10 @@ impl Tree {
             }
         }
 
+        for path in &tables_to_merge {
+            self.index_cache.remove(path);
+            self.index_cache.lru_queue.retain(|p| !p.eq(path));
+        }
         let new_table_path = self.write_ss_table(&merged_data);
         self.ss_tables.push(new_table_path.clone());
 
@@ -1087,7 +1273,17 @@ impl Tree {
         }
     }
 
-    fn read_key_from_ss_table(&self, path: &PathBuf, key: &[u8]) -> Option<DataValue> {
+    fn read_key_from_ss_table(&mut self, path: &PathBuf, key: &[u8]) -> Option<DataValue> {
+        if self.settings.enable_index_cache {
+            if let Some(cached_index) = self.index_cache.get(path) {
+                if let Some(&offset) = cached_index.get(key) {
+                    let file = File::open(path).ok()?;
+                    let mut reader = BufReader::new(file);
+                    return self.read_data_entry(&mut reader, offset).ok();
+                }
+            }
+        }
+
         let file = File::open(path).ok()?;
         let mut reader = BufReader::new(file);
 
@@ -1096,15 +1292,15 @@ impl Tree {
         }
 
         let index_offset = self.read_footer(&mut reader).ok()?;
-
-        // if !self.check_bloom_filter_safe(&mut reader, bloom_offset, key) {
-        //     return None;
-        // }
-
         let data_offset = self.find_key_in_index(&mut reader, index_offset, key)?;
 
-        self.read_data_entry(&mut reader, data_offset)
-            .ok()
+        if self.settings.enable_index_cache {
+            if let Ok(index) = self.read_index(&mut reader, index_offset) {
+                self.index_cache.put(path.clone(), index);
+            }
+        }
+
+        self.read_data_entry(&mut reader, data_offset).ok()
     }
 
     fn validate_header(&self, reader: &mut BufReader<File>) -> std::io::Result<()> {
@@ -1142,10 +1338,6 @@ impl Tree {
         let mut index_offset_bytes = [0u8; 8];
         reader.read_exact(&mut index_offset_bytes)?;
         let index_offset = u64::from_le_bytes(index_offset_bytes);
-
-        // let mut bloom_offset_bytes = [0u8; 8];
-        // reader.read_exact(&mut bloom_offset_bytes)?;
-        // let bloom_offset = u64::from_le_bytes(bloom_offset_bytes);
 
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
@@ -1191,7 +1383,12 @@ impl Tree {
         Ok(index)
     }
 
-    fn find_key_in_index(&self, reader: &mut BufReader<File>, index_offset: u64, key: &[u8]) -> Option<u64> {
+    fn find_key_in_index(
+        &self,
+        reader: &mut BufReader<File>,
+        index_offset: u64,
+        key: &[u8],
+    ) -> Option<u64> {
         reader.seek(SeekFrom::Start(index_offset)).ok()?;
 
         let mut index_num_entries_count_bytes = [0u8; 4];
@@ -1239,9 +1436,7 @@ impl Tree {
                 std::cmp::Ordering::Less => {
                     left = mid + 1;
                 }
-                std::cmp::Ordering::Greater => {
-                    right = mid
-                }
+                std::cmp::Ordering::Greater => right = mid,
             }
         }
 
@@ -1272,12 +1467,11 @@ impl Tree {
         match bincode::decode_from_slice(&value_bytes, self.settings.bincode_config) {
             Ok((decoded, _)) => Ok(decoded),
             Err(e) => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Deserialization error: {}", e),
-                )),
+                std::io::ErrorKind::InvalidData,
+                format!("Deserialization error: {}", e),
+            )),
         }
     }
-
 }
 
 #[derive(Debug, Eq)]
