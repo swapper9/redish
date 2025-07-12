@@ -24,5 +24,5 @@ pub mod util;
 pub mod config;
 mod logger;
 
-pub use crate::tree::DataValue;
+pub use crate::tree::{Tree, DataValue, TreeSettings, TreeSettingsBuilder};
 pub use bincode::{Decode, Encode};
