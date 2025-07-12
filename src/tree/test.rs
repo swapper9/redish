@@ -37,6 +37,7 @@ mod test {
             bincode_config: Default::default(),
             mem_table_max_size: 1000,
             enable_index_cache: false,
+            enable_value_cache: false,
         });
         let tree2 = Tree::load_with_settings(TreeSettings::default());
         let tree3 = Tree::load_with_settings(
@@ -108,7 +109,6 @@ mod test {
         println!("tree.mem_table.len: {}", tree.mem_table.len());
         println!("tree.immutable_mem_tables.len: {}", tree.immutable_mem_tables.len());
         println!("tree.ss_tables.len: {}", tree.ss_tables.len());
-        println!("{:?}", tree.get_cache_stats());
         let flush_start = std::time::Instant::now();
         tree.flush();
         let flush_duration = flush_start.elapsed();
@@ -164,7 +164,8 @@ mod test {
                  max_entries as f64 / flush_duration.as_millis() as f64);
         println!("Search speed through get_typed (random): {:.2} searches/ms",
                  random_indices.len() as f64 / normal_search_duration.as_millis() as f64);
-        println!("{:?}", tree.get_cache_stats());
+        println!("{:?}", tree.get_index_cache_stats());
+        println!("{:?}", tree.get_value_cache_stats());
         clean_temp_dir();
     }
 }

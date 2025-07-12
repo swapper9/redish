@@ -1,11 +1,7 @@
 #[cfg(test)]
 mod test;
 
-use crate::config::{
-    BINCODE_CONFIG, CURRENT_VERSION, DEFAULT_DB_PATH, DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY,
-    DEFAULT_INDEX_CACHE_MEMORY_LIMIT, DEFAULT_MEM_TABLE_SIZE, FOOTER_MAGIC_NUMBER, FOOTER_SIZE,
-    HEADER_MAGIC_NUMBER,
-};
+use crate::config::{BINCODE_CONFIG, CURRENT_VERSION, DEFAULT_DB_PATH, DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY, DEFAULT_INDEX_CACHE_MEMORY_LIMIT, DEFAULT_MEM_TABLE_SIZE, DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY, DEFAULT_VALUE_CACHE_MEMORY_LIMIT, FOOTER_MAGIC_NUMBER, FOOTER_SIZE, HEADER_MAGIC_NUMBER};
 use crate::{logger, util};
 use bincode::{Decode, Encode};
 use crc32fast::Hasher;
@@ -20,6 +16,194 @@ use std::time::{Duration, SystemTime};
 static INIT: Lazy<()> = Lazy::new(|| {
     logger::init_logger().expect("Logger was not initialized!");
 });
+
+#[derive(Clone, Debug)]
+pub struct CacheKey {
+    pub sstable_path: PathBuf,
+    pub key: Vec<u8>,
+}
+
+impl std::hash::Hash for CacheKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.sstable_path.hash(state);
+        self.key.hash(state);
+    }
+}
+
+impl PartialEq for CacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.sstable_path == other.sstable_path && self.key == other.key
+    }
+}
+
+impl Eq for CacheKey {}
+
+pub struct LRUValueCache {
+    cache: HashMap<CacheKey, DataValue>,
+    lru_queue: VecDeque<CacheKey>,
+    max_capacity: usize,
+    memory_limit: usize,
+    current_memory_usage: usize,
+    hit_count: u64,
+    miss_count: u64,
+    eviction_count: u64,
+}
+
+impl Default for LRUValueCache {
+    fn default() -> Self {
+        Self {
+            cache: HashMap::new(),
+            lru_queue: VecDeque::new(),
+            max_capacity: DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY,
+            memory_limit: DEFAULT_VALUE_CACHE_MEMORY_LIMIT,
+            current_memory_usage: 0,
+            hit_count: 0,
+            miss_count: 0,
+            eviction_count: 0,
+        }
+    }
+}
+
+impl LRUValueCache {
+    pub fn new(max_capacity: usize, memory_limit: usize) -> Self {
+        Self {
+            cache: HashMap::with_capacity(max_capacity),
+            lru_queue: VecDeque::with_capacity(max_capacity),
+            max_capacity,
+            memory_limit,
+            current_memory_usage: 0,
+            hit_count: 0,
+            miss_count: 0,
+            eviction_count: 0,
+        }
+    }
+
+    pub fn get(&mut self, sstable_path: &PathBuf, key: &[u8]) -> Option<DataValue> {
+        let cache_key = CacheKey {
+            sstable_path: sstable_path.clone(),
+            key: key.to_vec(),
+        };
+
+        if let Some(value) = self.cache.get(&cache_key).cloned() {
+            self.hit_count += 1;
+            self.move_to_back(&cache_key);
+            Some(value)
+        } else {
+            self.miss_count += 1;
+            None
+        }
+    }
+
+    pub fn put(&mut self, sstable_path: PathBuf, key: Vec<u8>, value: DataValue) {
+        let cache_key = CacheKey {
+            sstable_path: sstable_path,
+            key,
+        };
+
+        let value_size = self.estimate_value_size(&value);
+
+        if let Some(old_value) = self.cache.get(&cache_key) {
+            let old_size = self.estimate_value_size(old_value);
+            self.current_memory_usage = self.current_memory_usage
+                .saturating_sub(old_size)
+                .saturating_add(value_size);
+            self.cache.insert(cache_key.clone(), value);
+            self.move_to_back(&cache_key);
+            return;
+        }
+
+        while (self.cache.len() >= self.max_capacity ||
+            self.current_memory_usage + value_size > self.memory_limit) &&
+            !self.cache.is_empty() {
+            if !self.evict_lru() {
+                break;
+            }
+        }
+
+        if self.cache.len() < self.max_capacity &&
+            self.current_memory_usage + value_size <= self.memory_limit {
+            self.cache.insert(cache_key.clone(), value);
+            self.lru_queue.push_back(cache_key);
+            self.current_memory_usage += value_size;
+        }
+    }
+
+    pub fn remove(&mut self, sstable_path: &PathBuf, key: &[u8]) {
+        let cache_key = CacheKey {
+            sstable_path: sstable_path.clone(),
+            key: key.to_vec(),
+        };
+
+        if let Some(value) = self.cache.remove(&cache_key) {
+            let value_size = self.estimate_value_size(&value);
+            self.current_memory_usage = self.current_memory_usage.saturating_sub(value_size);
+            self.lru_queue.retain(|k| k != &cache_key);
+        }
+    }
+
+    pub fn invalidate_sstable(&mut self, sstable_path: &PathBuf) {
+        let keys_to_remove: Vec<CacheKey> = self.cache.keys()
+            .filter(|k| &k.sstable_path == sstable_path)
+            .cloned()
+            .collect();
+
+        for key in keys_to_remove {
+            self.remove(&key.sstable_path, &key.key);
+        }
+    }
+
+    fn move_to_back(&mut self, cache_key: &CacheKey) {
+        if let Some(pos) = self.lru_queue.iter().position(|k| k == cache_key) {
+            let key = self.lru_queue.remove(pos).unwrap();
+            self.lru_queue.push_back(key);
+        }
+    }
+
+    fn evict_lru(&mut self) -> bool {
+        if let Some(lru_key) = self.lru_queue.pop_front() {
+            if let Some(value) = self.cache.remove(&lru_key) {
+                let value_size = self.estimate_value_size(&value);
+                self.current_memory_usage = self.current_memory_usage.saturating_sub(value_size);
+                self.eviction_count += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn estimate_value_size(&self, value: &DataValue) -> usize {
+        size_of::<DataValue>() + value.get_data().len()
+    }
+
+    fn stats(&self) -> CacheStats {
+        CacheStats {
+            size: self.cache.len(),
+            hit_count: self.hit_count,
+            miss_count: self.miss_count,
+            eviction_count: self.eviction_count,
+            hit_rate: if self.hit_count + self.miss_count > 0 {
+                self.hit_count as f64 / (self.hit_count + self.miss_count) as f64
+            } else {
+                0.0
+            },
+            memory_limit: self.memory_limit,
+            memory_utilization: if self.memory_limit > 0 {
+                self.current_memory_usage as f64 / self.memory_limit as f64
+            } else {
+                0.0
+            },
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.lru_queue.clear();
+        self.current_memory_usage = 0;
+        self.hit_count = 0;
+        self.miss_count = 0;
+        self.eviction_count = 0;
+    }
+}
 
 #[derive(Clone, Debug, Encode, Decode, Eq, PartialEq)]
 pub struct DataValue {
@@ -196,7 +380,7 @@ impl LRUIndexCache {
         }
     }
 
-    pub fn stats(&self) -> CacheStats {
+    fn stats(&self) -> CacheStats {
         CacheStats {
             size: self.cache.len(),
             hit_count: self.hit_count,
@@ -295,6 +479,7 @@ pub struct TreeSettings {
     bincode_config: bincode::config::Configuration,
     mem_table_max_size: usize,
     enable_index_cache: bool,
+    enable_value_cache: bool,
 }
 
 impl Default for TreeSettings {
@@ -304,6 +489,7 @@ impl Default for TreeSettings {
             bincode_config: BINCODE_CONFIG,
             mem_table_max_size: DEFAULT_MEM_TABLE_SIZE as usize,
             enable_index_cache: true,
+            enable_value_cache: true,
         }
     }
 }
@@ -425,6 +611,7 @@ impl TreeSettingsBuilder {
                 .mem_table_max_size
                 .unwrap_or(DEFAULT_MEM_TABLE_SIZE as usize),
             enable_index_cache: true,
+            enable_value_cache: true,
         }
     }
 }
@@ -435,6 +622,7 @@ pub struct Tree {
     ss_tables: Vec<PathBuf>,
     settings: TreeSettings,
     index_cache: LRUIndexCache,
+    value_cache: LRUValueCache,
 }
 
 impl Drop for Tree {
@@ -460,6 +648,7 @@ impl Tree {
             ss_tables: Vec::new(),
             settings: TreeSettings::default(),
             index_cache: LRUIndexCache::default(),
+            value_cache: LRUValueCache::default(),
         }
     }
 
@@ -481,6 +670,7 @@ impl Tree {
                 ..TreeSettings::default()
             },
             index_cache: LRUIndexCache::default(),
+            value_cache: LRUValueCache::default(),
         }
     }
 
@@ -499,15 +689,24 @@ impl Tree {
             ss_tables: Vec::new(),
             settings,
             index_cache: LRUIndexCache::default(),
+            value_cache: LRUValueCache::default(),
         }
     }
 
-    pub fn get_cache_stats(&self) -> CacheStats {
+    pub fn get_index_cache_stats(&self) -> CacheStats {
         self.index_cache.stats()
+    }
+
+    pub fn get_value_cache_stats(&self) -> CacheStats {
+        self.value_cache.stats()
     }
 
     pub fn clear_index_cache(&mut self) {
         self.index_cache.clear();
+    }
+
+    pub fn clear_value_cache(&mut self) {
+        self.value_cache.clear();
     }
 
     /// Creates and loads a Tree from the default database path.
@@ -840,9 +1039,9 @@ impl Tree {
             }
         }
 
-        let ss_tables = self.ss_tables.clone();
-        for sst_path in ss_tables.iter().rev() {
-            if let Some(value) = self.read_key_from_ss_table(sst_path, key) {
+        let sstables = self.ss_tables.clone();
+        for sst_path in sstables.iter().rev() {
+            if let Some(value) = self.read_key_from_sstable(sst_path, key) {
                 if !value.is_expired() {
                     return Some(value.get_data().to_vec());
                 }
@@ -975,11 +1174,11 @@ impl Tree {
             .map(|table| table.values().filter(|value| !value.is_expired()).count())
             .sum();
 
-        let ss_table_count: usize = self
+        let sstable_count: usize = self
             .ss_tables
             .iter()
             .map(|table_path| {
-                let table = self.load_ss_table(table_path);
+                let table = self.load_sstable(table_path);
                 table
                     .values()
                     .filter(|value| !value.is_expired() || !value.is_tombstone())
@@ -987,7 +1186,7 @@ impl Tree {
             })
             .sum();
 
-        mem_count + immutable_count + ss_table_count
+        mem_count + immutable_count + sstable_count
     }
 
     /// Gets the remaining TTL for a key.
@@ -1057,15 +1256,15 @@ impl Tree {
             None => return,
         };
 
-        let new_ss_table_path = self.write_ss_table(&immutable_table);
-        self.ss_tables.push(new_ss_table_path.clone());
+        let new_sstable_path = self.write_sstable(&immutable_table);
+        self.ss_tables.push(new_sstable_path.clone());
 
         if self.ss_tables.len() > 2 {
-            self.merge_ss_tables();
+            self.merge_sstables();
         }
     }
 
-    fn load_ss_table(&self, path: &PathBuf) -> BTreeMap<Vec<u8>, DataValue> {
+    fn load_sstable(&self, path: &PathBuf) -> BTreeMap<Vec<u8>, DataValue> {
         let mut table = BTreeMap::new();
 
         match File::open(path) {
@@ -1107,15 +1306,15 @@ impl Tree {
         table
     }
 
-    fn write_ss_table(&mut self, table: &BTreeMap<Vec<u8>, DataValue>) -> PathBuf {
-        let new_ss_table_number = match util::find_last_ss_table_number(&self.settings.db_path) {
+    fn write_sstable(&mut self, table: &BTreeMap<Vec<u8>, DataValue>) -> PathBuf {
+        let new_sstable_number = match util::find_last_sstable_number(&self.settings.db_path) {
             None => 0,
             Some(number) => number + 1,
         };
         let table_path = self
             .settings
             .db_path
-            .join(format!("sstable_{}.sst", new_ss_table_number));
+            .join(format!("sstable_{}.sst", new_sstable_number));
         let file = File::create(&table_path).unwrap();
         let mut writer = BufWriter::new(file);
 
@@ -1136,7 +1335,9 @@ impl Tree {
         self.write_footer(&mut writer, index_offset).unwrap();
 
         writer.flush().unwrap();
-        self.index_cache.put(table_path.clone(), index);
+        if self.settings.enable_index_cache {
+            self.index_cache.put(table_path.clone(), index);
+        }
         table_path
     }
 
@@ -1191,7 +1392,7 @@ impl Tree {
         Ok(())
     }
 
-    fn merge_ss_tables(&mut self) {
+    fn merge_sstables(&mut self) {
         let tables_to_merge_count = std::cmp::min(self.ss_tables.len(), 3);
         if tables_to_merge_count < 2 {
             return;
@@ -1203,7 +1404,7 @@ impl Tree {
         let mut table_data: Vec<BTreeMap<Vec<u8>, DataValue>> =
             Vec::with_capacity(tables_to_merge.len());
         for table_path in &tables_to_merge {
-            table_data.push(self.load_ss_table(table_path));
+            table_data.push(self.load_sstable(table_path));
         }
 
         let mut iterators: Vec<_> = table_data.iter().map(|table| table.iter()).collect();
@@ -1258,11 +1459,20 @@ impl Tree {
             }
         }
 
-        for path in &tables_to_merge {
-            self.index_cache.remove(path);
-            self.index_cache.lru_queue.retain(|p| !p.eq(path));
+        if self.settings.enable_index_cache {
+            for path in &tables_to_merge {
+                self.index_cache.remove(path);
+                self.index_cache.lru_queue.retain(|p| !p.eq(path));
+                self.index_cache.remove(path);
+            }
         }
-        let new_table_path = self.write_ss_table(&merged_data);
+        if self.settings.enable_value_cache {
+            for path in &tables_to_merge {
+                self.value_cache.invalidate_sstable(path);
+            }
+        }
+
+        let new_table_path = self.write_sstable(&merged_data);
         self.ss_tables.push(new_table_path.clone());
 
         for path in tables_to_merge {
@@ -1273,13 +1483,33 @@ impl Tree {
         }
     }
 
-    fn read_key_from_ss_table(&mut self, path: &PathBuf, key: &[u8]) -> Option<DataValue> {
+    fn read_key_from_sstable(&mut self, path: &PathBuf, key: &[u8]) -> Option<DataValue> {
+        if self.settings.enable_value_cache {
+            if let Some(cached_value) = self.value_cache.get(path, key) {
+                if !cached_value.is_expired() {
+                    return Some(cached_value);
+                } else {
+                    self.value_cache.remove(path, key);
+                }
+            }
+        }
+
         if self.settings.enable_index_cache {
             if let Some(cached_index) = self.index_cache.get(path) {
                 if let Some(&offset) = cached_index.get(key) {
                     let file = File::open(path).ok()?;
                     let mut reader = BufReader::new(file);
-                    return self.read_data_entry(&mut reader, offset).ok();
+                    match self.read_data_entry(&mut reader, offset) {
+                        Ok(data_value) => {
+                            if self.settings.enable_value_cache {
+                                self.value_cache.put(path.clone(), key.to_vec(), data_value.clone());
+                            }
+                            return Some(data_value)
+                        }
+                        Err(e) => {
+                            error!("Error reading data entry from SSTable {:?}: {}", path, e);
+                        }
+                    }
                 }
             }
         }
@@ -1300,7 +1530,18 @@ impl Tree {
             }
         }
 
-        self.read_data_entry(&mut reader, data_offset).ok()
+        match self.read_data_entry(&mut reader, data_offset) {
+            Ok(data_value) => {
+                if self.settings.enable_value_cache {
+                    self.value_cache.put(path.clone(), key.to_vec(), data_value.clone());
+                }
+                Some(data_value)
+            }
+            Err(e) => {
+                log::error!("Error reading data entry from SSTable {:?} with offset {:?}: {}", path, data_offset, e);
+                None
+            }
+        }
     }
 
     fn validate_header(&self, reader: &mut BufReader<File>) -> std::io::Result<()> {

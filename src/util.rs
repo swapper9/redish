@@ -14,7 +14,7 @@ pub(crate) fn logo() {
     }
 }
 
-pub(crate) fn find_last_ss_table_number(directory: &PathBuf) -> Option<usize> {
+pub(crate) fn find_last_sstable_number(directory: &PathBuf) -> Option<usize> {
     fs::read_dir(directory)
         .ok()?
         .filter_map(|entry| entry.ok())
@@ -30,20 +30,3 @@ pub(crate) fn find_last_ss_table_number(directory: &PathBuf) -> Option<usize> {
         })
         .max()
 }
-
-// fn extract_number(path: &PathBuf) -> usize {
-//     let file_name = path.file_name().unwrap().to_string_lossy();
-//     if file_name.starts_with("sstable_") && file_name.ends_with(".sst") {
-//         let number_part = &file_name[8..file_name.len() - 4];
-//         number_part.parse::<usize>().unwrap_or(0)
-//     } else {
-//         0
-//     }
-// }
-
-// pub(crate) fn sort_table_paths_by_number(mut table_paths: Vec<PathBuf>) -> (PathBuf, PathBuf) {
-//     table_paths.sort_by(|a, b| {
-//         extract_number(a).cmp(&extract_number(b))
-//     });
-//     (table_paths[0].clone(), table_paths[1].clone())
-// }
