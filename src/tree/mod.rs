@@ -3,10 +3,12 @@ pub mod data_value;
 pub mod settings;
 mod sstable;
 mod test;
+mod compression;
 
 pub use cache::*;
 pub use data_value::*;
 pub use settings::*;
+pub use compression::*;
 
 use crate::config::{DEFAULT_DB_PATH};
 use crate::{logger, util};
@@ -14,6 +16,7 @@ use bincode::{Encode};
 use log::{debug, warn};
 use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -28,6 +31,7 @@ pub struct Tree {
     settings: TreeSettings,
     index_cache: LRUIndexCache,
     value_cache: LRUValueCache,
+    compression_stats: CompressionStats
 }
 
 impl Drop for Tree {
@@ -54,6 +58,7 @@ impl Tree {
             settings: TreeSettings::default(),
             index_cache: LRUIndexCache::default(),
             value_cache: LRUValueCache::default(),
+            compression_stats: CompressionStats::default(),
         }
     }
 
@@ -65,18 +70,12 @@ impl Tree {
     /// # Returns
     /// A new Tree instance configured with the specified path
     pub fn new_with_path(path: &str) -> Self {
-        util::logo();
-        Self {
-            mem_table: BTreeMap::new(),
-            immutable_mem_tables: VecDeque::new(),
-            ss_tables: Vec::new(),
-            settings: TreeSettings {
-                db_path: PathBuf::from(path),
-                ..TreeSettings::default()
-            },
-            index_cache: LRUIndexCache::default(),
-            value_cache: LRUValueCache::default(),
-        }
+        let mut tree = Self::new();
+        tree.settings = TreeSettings {
+            db_path: PathBuf::from(path),
+            ..TreeSettings::default()
+        };
+        tree
     }
 
     /// Creates a new Tree with custom settings.
@@ -87,15 +86,9 @@ impl Tree {
     /// # Returns
     /// A new Tree instance with the specified settings
     pub fn new_with_settings(settings: TreeSettings) -> Self {
-        util::logo();
-        Self {
-            mem_table: BTreeMap::new(),
-            immutable_mem_tables: VecDeque::new(),
-            ss_tables: Vec::new(),
-            settings,
-            index_cache: LRUIndexCache::default(),
-            value_cache: LRUValueCache::default(),
-        }
+        let mut tree = Self::new();
+        tree.settings = settings;
+        tree
     }
 
     pub fn get_index_cache_stats(&self) -> CacheStats {
@@ -106,12 +99,49 @@ impl Tree {
         self.value_cache.stats()
     }
 
+    pub fn get_compression_stats(&self) -> &CompressionStats {
+        &self.compression_stats
+    }
+
+    pub fn reset_compression_stats(&mut self) {
+        self.compression_stats.reset();
+    }
+
     pub fn clear_index_cache(&mut self) {
         self.index_cache.clear();
     }
 
     pub fn clear_value_cache(&mut self) {
         self.value_cache.clear();
+    }
+
+    fn apply_compression(&mut self, data: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
+        if self.settings.compressor.config.compression_type == CompressionType::None {
+            Ok(data)
+        } else {
+            let start_time = std::time::Instant::now();
+            let original_size = data.len();
+            let compressed = self.settings.compressor.compress(&data)?;
+            let compression_time = start_time.elapsed().as_millis();
+            self.compression_stats.update_compression(
+                original_size,
+                compressed.len(),
+                compression_time
+            );
+            Ok(compressed)
+        }
+    }
+
+    fn apply_decompression(&mut self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        if self.settings.compressor.config.compression_type == CompressionType::None {
+            Ok(data.to_vec())
+        } else {
+            let start_time = std::time::Instant::now();
+            let decompressed = self.settings.compressor.decompress(data)?;
+            let decompression_time = start_time.elapsed().as_millis();
+            self.compression_stats.update_decompression(decompression_time);
+            Ok(decompressed)
+        }
     }
 
     /// Creates and loads a Tree from the default database path.
@@ -311,8 +341,14 @@ impl Tree {
     /// * `value` - The value as a byte vector
     /// * `ttl` - Optional time-to-live duration
     pub fn put_to_tree(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) {
-        let data_value = DataValue::new(value, ttl);
-        self.mem_table.insert(key, data_value);
+        let data = match self.apply_compression(value.to_vec()) {
+            Ok(data) => data,
+            Err(e) => {
+                log::error!("Error compressing value for key '{:?}': {}", key, e);
+                return;
+            }
+        };
+        self.mem_table.insert(key, DataValue::new(data, ttl));
         if self.mem_table.len() > self.settings.mem_table_max_size {
             self.flush_mem_table();
         }
@@ -411,14 +447,16 @@ impl Tree {
     pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(value) = self.mem_table.get(key) {
             if !value.is_expired() {
-                return Some(value.get_data().to_vec());
+                let data = value.get_data().to_vec();
+                return self.decompress_value_data(data);
             }
         }
 
         for immutable_mem_table in self.immutable_mem_tables.iter().rev() {
             if let Some(value) = immutable_mem_table.get(key) {
                 if !value.is_expired() {
-                    return Some(value.get_data().to_vec());
+                    let data = value.get_data().to_vec();
+                    return self.decompress_value_data(data);
                 }
             }
         }
@@ -427,7 +465,8 @@ impl Tree {
         for sst_path in sstables.iter().rev() {
             if let Some(value) = self.read_key_from_sstable(sst_path, key) {
                 if !value.is_expired() {
-                    return Some(value.get_data().to_vec());
+                    let data = value.get_data().to_vec();
+                    return self.decompress_value_data(data);
                 }
             }
         }
@@ -640,11 +679,28 @@ impl Tree {
             None => return,
         };
 
-        let new_sstable_path = self.write_sstable(&immutable_table);
+        let new_sstable_path = match self.write_sstable(&immutable_table) {
+            Ok(path) => path,
+            Err(e) => {
+                log::error!("Error writing SSTable: {}", e);
+                return;
+            }       
+        };
         self.ss_tables.push(new_sstable_path.clone());
 
         if self.ss_tables.len() > 2 {
             self.merge_sstables();
         }
     }
+
+    fn decompress_value_data(&mut self, data: Vec<u8>) -> Option<Vec<u8>> {
+        match self.apply_decompression(&data) {
+            Ok(decompressed) => Some(decompressed),
+            Err(e) => {
+                log::error!("Error decompressing value: {}", e);
+                None
+            }
+        }
+    }
+
 }

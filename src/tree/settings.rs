@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use crate::config::{DEFAULT_DB_PATH, BINCODE_CONFIG, DEFAULT_MEM_TABLE_SIZE};
+use crate::tree::{CompressionConfig, Compressor};
 
 #[derive(Clone)]
 pub struct TreeSettings {
@@ -8,6 +9,7 @@ pub struct TreeSettings {
     pub mem_table_max_size: usize,
     pub enable_index_cache: bool,
     pub enable_value_cache: bool,
+    pub compressor: Compressor,
 }
 
 impl Default for TreeSettings {
@@ -18,6 +20,7 @@ impl Default for TreeSettings {
             mem_table_max_size: DEFAULT_MEM_TABLE_SIZE as usize,
             enable_index_cache: true,
             enable_value_cache: true,
+            compressor: Compressor::new(CompressionConfig::default()),
         }
     }
 }
@@ -140,6 +143,7 @@ impl TreeSettingsBuilder {
                 .unwrap_or(DEFAULT_MEM_TABLE_SIZE as usize),
             enable_index_cache: true,
             enable_value_cache: true,
+            compressor: Compressor::new(CompressionConfig::balanced()),
         }
     }
 }

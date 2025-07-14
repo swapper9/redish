@@ -31,6 +31,9 @@ once_cell = "1.21.3"
 rand = "0.9.1"
 serial_test = "3.2.0"
 crc32fast = "1.4.2"
+lz4 = "1.24"
+zstd = "0.13"
+snap = "1.1"
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
@@ -50,4 +53,8 @@ harness = false
 
 [[bench]]
 name = "memory_benchmarks"
+harness = false
+
+[[bench]]
+name = "compression_benchmarks"
 harness = false

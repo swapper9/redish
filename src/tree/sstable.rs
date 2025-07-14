@@ -191,7 +191,7 @@ impl Tree {
         table
     }
 
-    pub(crate) fn write_sstable(&mut self, table: &BTreeMap<Vec<u8>, DataValue>) -> PathBuf {
+    pub(crate) fn write_sstable(&mut self, table: &BTreeMap<Vec<u8>, DataValue>) -> Result<PathBuf, std::io::Error> {
         let new_sstable_number = match util::find_last_sstable_number(&self.settings.db_path) {
             None => 0,
             Some(number) => number + 1,
@@ -200,30 +200,34 @@ impl Tree {
             .settings
             .db_path
             .join(format!("sstable_{}.sst", new_sstable_number));
-        let file = File::create(&table_path).unwrap();
+        if let Some(parent_dir) = table_path.parent() {
+            std::fs::create_dir_all(parent_dir)?;
+        }
+
+        let file = File::create(&table_path)?;
         let mut writer = BufWriter::new(file);
 
-        self.write_header(&mut writer).unwrap();
+        self.write_header(&mut writer)?;
 
         let mut index = BTreeMap::new();
 
         for (key, value) in table {
-            let offset = writer.stream_position().unwrap();
-            self.write_data_entry(&mut writer, key, value).unwrap();
+            let offset = writer.stream_position()?;
+            self.write_data_entry(&mut writer, key, value)?;
 
             index.insert(key.clone(), offset);
         }
 
-        let index_offset = writer.stream_position().unwrap();
-        self.write_index(&mut writer, &index).unwrap();
+        let index_offset = writer.stream_position()?;
+        self.write_index(&mut writer, &index)?;
 
-        self.write_footer(&mut writer, index_offset).unwrap();
+        self.write_footer(&mut writer, index_offset)?;
 
-        writer.flush().unwrap();
+        writer.flush()?;
         if self.settings.enable_index_cache {
             self.index_cache.put(table_path.clone(), index);
         }
-        table_path
+        Ok(table_path)
     }
 
     fn write_header(&self, writer: &mut BufWriter<File>) -> std::io::Result<()> {
@@ -357,7 +361,13 @@ impl Tree {
             }
         }
 
-        let new_table_path = self.write_sstable(&merged_data);
+        let new_table_path = match self.write_sstable(&merged_data) {
+            Ok(path) => path,
+            Err(e) => {
+                log::error!("Error writing merged SSTable: {}", e);
+                return;
+            }
+        };
         self.ss_tables.push(new_table_path.clone());
 
         for path in tables_to_merge {
