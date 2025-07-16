@@ -1,8 +1,9 @@
-use std::collections::{HashMap, VecDeque};
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 use crate::config::{DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY, DEFAULT_INDEX_CACHE_MEMORY_LIMIT, DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY, DEFAULT_VALUE_CACHE_MEMORY_LIMIT};
 use crate::tree::DataValue;
+use std::collections::BTreeMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::path::PathBuf;
 
 pub struct LRUValueCache {
     cache: HashMap<CacheKey, DataValue>,
@@ -377,3 +378,40 @@ pub struct CacheStats {
     pub memory_limit: usize,
     pub memory_utilization: f64,
 }
+
+impl fmt::Display for CacheStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let memory_limit_mb = self.memory_limit as f64 / (1024.0 * 1024.0);
+        let memory_utilization_bytes = (self.memory_utilization * self.memory_limit as f64) as usize;
+        let memory_utilization_mb = memory_utilization_bytes as f64 / (1024.0 * 1024.0);
+        let memory_utilization_percent = self.memory_utilization * 100.0;
+
+        let (limit_value, limit_unit) = if memory_limit_mb >= 1.0 {
+            (memory_limit_mb, "MB")
+        } else {
+            (self.memory_limit as f64 / 1024.0, "KB")
+        };
+
+        let (utilization_value, utilization_unit) = if memory_utilization_mb >= 1.0 {
+            (memory_utilization_mb, "MB")
+        } else {
+            (memory_utilization_bytes as f64 / 1024.0, "KB")
+        };
+
+        write!(
+            f,
+            "Cache Stats: {} entries, {} hits, {} misses, {} evictions, {:.1}% hit rate, Memory: {:.2} {} / {:.2} {} ({:.1}%)",
+            self.size,
+            self.hit_count,
+            self.miss_count,
+            self.eviction_count,
+            self.hit_rate * 100.0,
+            utilization_value,
+            utilization_unit,
+            limit_value,
+            limit_unit,
+            memory_utilization_percent
+        )
+    }
+}
+
