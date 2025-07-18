@@ -2,12 +2,12 @@ use log4rs::{
     append::{
         console::ConsoleAppender,
         rolling_file::{
-            RollingFileAppender,
             policy::compound::{
-                CompoundPolicy,
+                roll::fixed_window::FixedWindowRoller,
                 trigger::size::SizeTrigger,
-                roll::fixed_window::FixedWindowRoller
+                CompoundPolicy
             },
+            RollingFileAppender,
         }
     },
     config::{Appender, Config, Root},

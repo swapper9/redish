@@ -1,5 +1,5 @@
-use std::time::{Duration, SystemTime};
 use bincode::{Decode, Encode};
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, Encode, Decode, Eq, PartialEq)]
 pub struct DataValue {

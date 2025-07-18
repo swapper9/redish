@@ -1,11 +1,11 @@
+use crate::config::{CURRENT_VERSION, FOOTER_MAGIC_NUMBER, FOOTER_SIZE, HEADER_MAGIC_NUMBER};
+use crate::{Tree, DataValue, util};
+use crc32fast::Hasher;
+use log::error;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use crc32fast::Hasher;
-use log::{debug, error};
-use crate::{Tree, DataValue, util};
-use crate::config::{CURRENT_VERSION, FOOTER_MAGIC_NUMBER, FOOTER_SIZE, HEADER_MAGIC_NUMBER};
 
 impl Tree {
     pub(crate) fn read_key_from_sstable(&mut self, path: &PathBuf, key: &[u8]) -> Option<DataValue> {
@@ -425,7 +425,6 @@ impl Tree {
 
             match index_key.as_slice().cmp(key) {
                 std::cmp::Ordering::Equal => {
-                    debug!("Key found in index: {:?}", String::from_utf8_lossy(key));
                     return Some(*offset);
                 }
                 std::cmp::Ordering::Less => {
@@ -435,7 +434,6 @@ impl Tree {
             }
         }
 
-        debug!("Key not found in index: {:?}", String::from_utf8_lossy(key));
         None
     }
 

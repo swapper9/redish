@@ -6,14 +6,14 @@ mod test;
 mod compression;
 
 pub use cache::*;
+pub use compression::*;
 pub use data_value::*;
 pub use settings::*;
-pub use compression::*;
 
-use crate::config::{DEFAULT_DB_PATH};
+use crate::config::DEFAULT_DB_PATH;
 use crate::{logger, util};
-use bincode::{Encode};
-use log::{debug, warn};
+use bincode::Encode;
+use log::warn;
 use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::error::Error;
@@ -91,26 +91,81 @@ impl Tree {
         tree
     }
 
+    /// Retrieves statistics for the index cache.
+    ///
+    /// Returns detailed performance metrics about the index cache, including
+    /// hit/miss ratios, memory usage, and eviction counts. This information
+    /// can be used to monitor cache performance and optimize cache settings.
+    ///
+    /// # Returns
+    /// A `CacheStats` struct containing:
+    /// - Size: Current number of cached entries
+    /// - Hit count: Number of successful cache lookups
+    /// - Miss count: Number of cache misses
+    /// - Eviction count: Number of entries evicted from cache
+    /// - Hit rate: Percentage of successful cache hits
+    /// - Memory utilization: Current memory usage percentage
     pub fn get_index_cache_stats(&self) -> CacheStats {
         self.index_cache.stats()
     }
 
+    /// Retrieves statistics for the value cache.
+    ///
+    /// Returns detailed performance metrics about the value cache, including
+    /// hit/miss ratios, memory usage, and eviction counts. This information
+    /// helps monitor how effectively the value cache is improving read performance.
+    ///
+    /// # Returns
+    /// A `CacheStats` struct containing cache performance metrics
     pub fn get_value_cache_stats(&self) -> CacheStats {
         self.value_cache.stats()
     }
 
+    /// Retrieves compression statistics for the tree.
+    ///
+    /// Returns a reference to the compression statistics that track compression
+    /// and decompression operations performed by the tree. This includes timing
+    /// information, compression ratios, and operation counts.
+    ///
+    /// # Returns
+    /// A reference to `CompressionStats` containing:
+    /// - Total operations performed
+    /// - Original and compressed data sizes
+    /// - Compression and decompression timings
+    /// - Compression ratio statistics
     pub fn get_compression_stats(&self) -> &CompressionStats {
         &self.compression_stats
     }
 
+    /// Resets all compression statistics to their initial values.
+    ///
+    /// This method clears all accumulated compression statistics, including
+    /// operation counts, timing data, and compression ratios. Useful for
+    /// benchmarking specific operations or periodically resetting metrics.
+    ///
+    /// # Effects
+    /// - Resets all counters to zero
+    /// - Clears timing statistics
+    /// - Resets compression ratio calculations
+    /// - Does not affect actual compressed data
     pub fn reset_compression_stats(&mut self) {
         self.compression_stats.reset();
     }
 
+    /// Clears all entries from the index cache.
+    ///
+    /// This method removes all cached SSTable indexes from memory, forcing
+    /// subsequent reads to reload index data from disk. This can be useful
+    /// for freeing memory or ensuring fresh index data is loaded.
     pub fn clear_index_cache(&mut self) {
         self.index_cache.clear();
     }
 
+    /// Clears all entries from the value cache.
+    ///
+    /// This method removes all cached data values from memory, forcing
+    /// subsequent reads to reload data from disk or memory tables. This
+    /// can help free memory or ensure fresh data is read.
     pub fn clear_value_cache(&mut self) {
         self.value_cache.clear();
     }
@@ -192,7 +247,6 @@ impl Tree {
             self.settings.db_path.clone()
         };
         if !db_path.exists() {
-            debug!("Database folder not exist, creating: {:?}", db_path);
             if let Err(e) = std::fs::create_dir_all(&db_path) {
                 panic!("Error creating folder for database: {}", e);
             }
@@ -242,21 +296,13 @@ impl Tree {
                         .unwrap_or(0)
                 });
 
-                debug!("Sorted SSTable files:");
-                for (i, file) in sstable_files.iter().enumerate() {
-                    debug!("  {}: {:?}", i, file);
-                }
-
                 for sstable_path in sstable_files {
                     if self.validate_sstable(&sstable_path) {
                         self.ss_tables.push(sstable_path.clone());
-                        debug!("Loaded SSTable: {:?}", sstable_path);
                     } else {
                         warn!("Damaged SSTable file: {:?}", sstable_path);
                     }
                 }
-
-                debug!("Loaded {} SSTable files", self.ss_tables.len());
 
                 self.cleanup_expired();
             }

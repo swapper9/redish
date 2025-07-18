@@ -383,7 +383,6 @@ pub struct Compressor {
 }
 
 impl Compressor {
-
     /// Creates a new compressor with the specified configuration.
     ///
     /// # Arguments

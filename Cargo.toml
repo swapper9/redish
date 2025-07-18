@@ -1,6 +1,6 @@
 [package]
 name = "redish"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["Swapper9 <swapper9@gmail.com>"]
 description = "A lightweight in-memory key-value database"

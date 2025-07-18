@@ -1,7 +1,46 @@
-use std::path::PathBuf;
-use crate::config::{DEFAULT_DB_PATH, BINCODE_CONFIG, DEFAULT_MEM_TABLE_SIZE};
+use crate::config::{BINCODE_CONFIG, DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE};
 use crate::tree::{CompressionConfig, Compressor};
+use std::path::PathBuf;
 
+/// Configuration settings for the LSM Tree database.
+///
+/// `TreeSettings` contains all the configuration options that control the behavior
+/// of the LSM Tree database, including storage paths, memory limits, caching options,
+/// and compression settings.
+///
+/// # Fields
+///
+/// ## Storage Configuration
+/// - `db_path`: The filesystem path where the database files will be stored
+/// - `bincode_config`: Configuration for the bincode serialization library
+///
+/// ## Memory Management
+/// - `mem_table_max_size`: Maximum number of entries in the memory table before flushing to disk
+///
+/// ## Caching Options
+/// - `enable_index_cache`: Whether to enable caching of SSTable indexes in memory
+/// - `enable_value_cache`: Whether to enable caching of frequently accessed values
+///
+/// ## Compression
+/// - `compressor`: The compression algorithm and settings to use for data storage
+///
+/// # Performance Tuning
+///
+/// ## Memory Table Size
+/// Larger memory tables reduce I/O operations but use more RAM
+/// 
+/// ## Index Cache
+/// Caching SSTable indexes improves read performance
+///
+/// ## Value Cache
+/// Caching frequently accessed values significantly improves read performance:
+///
+/// ## Compression
+/// Different compression algorithms offer various trade-offs:
+/// - **None**: No compression overhead, larger disk usage
+/// - **LZ4**: Fast compression/decompression, moderate compression ratio
+/// - **Zstd**: Better compression ratio, moderate speed
+/// - **Snappy**: Very fast, good for high-throughput scenarios
 #[derive(Clone)]
 pub struct TreeSettings {
     pub db_path: PathBuf,
@@ -72,6 +111,26 @@ impl TreeSettings {
     }
 }
 
+/// A builder for creating `TreeSettings` with a fluent API.
+///
+/// `TreeSettingsBuilder` provides a convenient way to construct `TreeSettings` instances
+/// with custom configurations. It uses the builder pattern to allow method chaining
+/// and provides sensible defaults for any unspecified options.
+///
+/// # Builder Pattern
+/// This builder follows the standard Rust builder pattern:
+/// 1. Create a new builder with `TreeSettingsBuilder::new()`
+/// 2. Configure options using the various setter methods
+/// 3. Build the final `TreeSettings` with `build()`
+///
+/// # Default Values
+/// Any options not explicitly set will use their default values:
+/// - `db_path`: Uses `DEFAULT_DB_PATH` from config
+/// - `bincode_config`: Uses `BINCODE_CONFIG` from config  
+/// - `mem_table_max_size`: Uses `DEFAULT_MEM_TABLE_SIZE` from config
+/// - `enable_index_cache`: `true`
+/// - `enable_value_cache`: `true`
+/// - `compressor`: Uses `CompressionConfig::balanced()`
 pub struct TreeSettingsBuilder {
     db_path: Option<PathBuf>,
     bincode_config: Option<bincode::config::Configuration>,

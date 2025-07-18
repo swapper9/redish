@@ -67,20 +67,6 @@ use std::path::PathBuf;
 /// let stats = cache.stats();
 /// println!("Hit rate: {:.2}%", stats.hit_rate_percentage());
 /// ```
-///
-/// # Use Cases
-///
-/// - **Hot data caching**: Store frequently accessed values
-/// - **Read-heavy workloads**: Reduce disk I/O for repeated reads
-/// - **Memory-constrained environments**: Bounded memory usage
-/// - **Performance optimization**: Fast access to recent data
-///
-/// # Configuration Guidelines
-///
-/// - **High-performance**: Large capacity + memory limits
-/// - **Memory-constrained**: Small capacity + strict memory limits
-/// - **Balanced**: Medium capacity with reasonable memory limits
-///
 /// # See Also
 ///
 /// - [`LRUValueCacheBuilder`] - For building configured instances
@@ -431,36 +417,6 @@ impl Default for LRUValueCacheBuilder {
 /// let stats = cache.stats();
 /// println!("Cache efficiency: {:.2}%", stats.hit_rate_percentage());
 /// ```
-///
-/// # Use Cases
-///
-/// - **SSTable optimization**: Avoid repeated index loading
-/// - **Read-heavy workloads**: Fast key lookups across multiple SSTables
-/// - **Large datasets**: Efficient access to frequently used tables
-/// - **Performance tuning**: Reduce disk I/O for index operations
-///
-/// # Configuration Guidelines
-///
-/// - **High-throughput**: Large capacity matching SSTable count
-/// - **Memory-limited**: Small capacity with strict memory limits
-/// - **Balanced**: Capacity ~2x active SSTable count
-///
-/// # Eviction Strategy
-///
-/// The cache uses a pure LRU eviction policy:
-/// 1. **Access tracking**: Each get/put updates LRU position
-/// 2. **Capacity eviction**: Remove oldest when max_capacity exceeded
-/// 3. **Memory eviction**: Remove oldest when memory_limit exceeded
-/// 4. **Batch eviction**: Multiple entries may be evicted per operation
-///
-/// # Performance Optimization
-///
-/// For optimal performance:
-/// - Size capacity to cover working set of SSTables
-/// - Set memory limit based on available system memory
-/// - Monitor hit rates and adjust capacity accordingly
-/// - Consider access patterns when sizing the cache
-///
 /// # See Also
 ///
 /// - [`LRUIndexCacheBuilder`] - For building configured instances
@@ -593,18 +549,55 @@ impl LRUIndexCache {
         size
     }
 
+    /// Returns the number of cached SSTable indexes.
+    ///
+    /// This method provides the current count of SSTable indexes stored in the cache.
+    /// Each cached entry represents one SSTable file's index data.
+    ///
+    /// # Returns
+    /// The number of SSTable indexes currently cached
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
+    /// Checks if the index cache is empty.
+    ///
+    /// Returns `true` if the cache contains no SSTable indexes, `false` otherwise.
+    /// This is equivalent to checking if `len() == 0` but may be more semantically clear.
+    ///
+    /// # Returns
+    /// `true` if the cache is empty, `false` if it contains at least one entry
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
 
+    /// Returns a list of all cached SSTable file paths.
+    ///
+    /// This method provides visibility into which SSTable files currently have
+    /// their indexes cached in memory. The returned paths are cloned from the
+    /// internal cache keys.
+    ///
+    /// # Returns
+    /// A `Vec<PathBuf>` containing the file paths of all cached SSTable indexes
     pub fn cached_paths(&self) -> Vec<PathBuf> {
         self.cache.keys().cloned().collect()
     }
 
+    /// Resizes the cache with new capacity and memory limits.
+    ///
+    /// This method updates the cache's maximum capacity and memory limit settings.
+    /// If the new limits are smaller than the current cache size, it will evict
+    /// the least recently used entries until the cache fits within the new constraints.
+    ///
+    /// # Arguments
+    /// * `new_capacity` - The new maximum number of entries the cache can hold
+    /// * `new_memory_limit` - The new maximum memory usage in bytes
+    ///
+    /// # Behavior
+    /// - Updates internal capacity and memory limit settings
+    /// - Evicts LRU entries if current size exceeds new limits
+    /// - Maintains LRU ordering during eviction
+    /// - Stops eviction if cache becomes empty
     pub fn resize(&mut self, new_capacity: usize, new_memory_limit: usize) {
         self.max_capacity = new_capacity;
         self.memory_limit = new_memory_limit;
