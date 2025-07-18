@@ -15,7 +15,7 @@ use crate::{logger, util};
 use bincode::Encode;
 use log::warn;
 use once_cell::sync::Lazy;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -31,7 +31,6 @@ pub struct Tree {
     settings: TreeSettings,
     index_cache: LRUIndexCache,
     value_cache: LRUValueCache,
-    compression_stats: CompressionStats
 }
 
 impl Drop for Tree {
@@ -58,7 +57,6 @@ impl Tree {
             settings: TreeSettings::default(),
             index_cache: LRUIndexCache::default(),
             value_cache: LRUValueCache::default(),
-            compression_stats: CompressionStats::default(),
         }
     }
 
@@ -121,37 +119,6 @@ impl Tree {
         self.value_cache.stats()
     }
 
-    /// Retrieves compression statistics for the tree.
-    ///
-    /// Returns a reference to the compression statistics that track compression
-    /// and decompression operations performed by the tree. This includes timing
-    /// information, compression ratios, and operation counts.
-    ///
-    /// # Returns
-    /// A reference to `CompressionStats` containing:
-    /// - Total operations performed
-    /// - Original and compressed data sizes
-    /// - Compression and decompression timings
-    /// - Compression ratio statistics
-    pub fn get_compression_stats(&self) -> &CompressionStats {
-        &self.compression_stats
-    }
-
-    /// Resets all compression statistics to their initial values.
-    ///
-    /// This method clears all accumulated compression statistics, including
-    /// operation counts, timing data, and compression ratios. Useful for
-    /// benchmarking specific operations or periodically resetting metrics.
-    ///
-    /// # Effects
-    /// - Resets all counters to zero
-    /// - Clears timing statistics
-    /// - Resets compression ratio calculations
-    /// - Does not affect actual compressed data
-    pub fn reset_compression_stats(&mut self) {
-        self.compression_stats.reset();
-    }
-
     /// Clears all entries from the index cache.
     ///
     /// This method removes all cached SSTable indexes from memory, forcing
@@ -174,27 +141,16 @@ impl Tree {
         if self.settings.compressor.config.compression_type == CompressionType::None {
             Ok(data)
         } else {
-            let start_time = std::time::Instant::now();
-            let original_size = data.len();
             let compressed = self.settings.compressor.compress(&data)?;
-            let compression_time = start_time.elapsed().as_millis();
-            self.compression_stats.update_compression(
-                original_size,
-                compressed.len(),
-                compression_time
-            );
             Ok(compressed)
         }
     }
 
-    fn apply_decompression(&mut self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn apply_decompression(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         if self.settings.compressor.config.compression_type == CompressionType::None {
             Ok(data.to_vec())
         } else {
-            let start_time = std::time::Instant::now();
             let decompressed = self.settings.compressor.decompress(data)?;
-            let decompression_time = start_time.elapsed().as_millis();
-            self.compression_stats.update_decompression(decompression_time);
             Ok(decompressed)
         }
     }
@@ -259,46 +215,36 @@ impl Tree {
 
         match std::fs::read_dir(&db_path) {
             Ok(entries) => {
-                let mut sstable_files_set = HashSet::new();
+                let mut sstable_files = Vec::new();
 
                 for entry in entries {
                     if let Ok(entry) = entry {
                         let path = entry.path();
-                        if path.is_file() {
-                            if let Some(extension) = path.extension() {
-                                if extension == "sst" {
-                                    if let Some(filename) = path.file_name() {
-                                        if filename.to_string_lossy().starts_with("sstable_") {
-                                            sstable_files_set.insert(path);
-                                        }
-                                    }
+                        if path.is_file() && path.extension().map_or(false, |ext| ext == "sst") {
+                            if let Some(filename) = path.file_name() {
+                                if filename.to_string_lossy().starts_with("sstable_") {
+                                    sstable_files.push(path);
                                 }
                             }
                         }
                     }
                 }
 
-                let mut sstable_files = Vec::new();
-                for path in sstable_files_set {
-                    sstable_files.push(path);
-                }
-
-                sstable_files.sort_by_key(|path| {
+                sstable_files.sort_by_cached_key(|path| {
                     path.file_name()
                         .and_then(|name| name.to_str())
                         .and_then(|name| {
-                            if name.starts_with("sstable_") && name.ends_with(".sst") {
-                                name[8..name.len() - 4].parse::<u64>().ok()
-                            } else {
-                                None
-                            }
+                            name.strip_prefix("sstable_")?
+                                .strip_suffix(".sst")?
+                                .parse::<u64>()
+                                .ok()
                         })
                         .unwrap_or(0)
                 });
 
                 for sstable_path in sstable_files {
                     if self.validate_sstable(&sstable_path) {
-                        self.ss_tables.push(sstable_path.clone());
+                        self.ss_tables.push(sstable_path);
                     } else {
                         warn!("Damaged SSTable file: {:?}", sstable_path);
                     }
@@ -351,9 +297,8 @@ impl Tree {
     where
         T: Encode,
     {
-        let key_bytes = key.as_bytes().to_vec();
         match bincode::encode_to_vec(value, self.settings.bincode_config) {
-            Ok(serialized) => self.put_with_ttl(key_bytes, serialized, ttl),
+            Ok(serialized) => self.put_with_ttl(key.as_bytes().to_vec(), serialized, ttl),
             Err(e) => log::error!("Error serializing value for key '{}': {}", key, e),
         }
     }
@@ -493,16 +438,14 @@ impl Tree {
     pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         if let Some(value) = self.mem_table.get(key) {
             if !value.is_expired() {
-                let data = value.get_data().to_vec();
-                return self.decompress_value_data(data);
+                return self.decompress_value_data(value.get_data());
             }
         }
 
         for immutable_mem_table in self.immutable_mem_tables.iter().rev() {
             if let Some(value) = immutable_mem_table.get(key) {
                 if !value.is_expired() {
-                    let data = value.get_data().to_vec();
-                    return self.decompress_value_data(data);
+                    return self.decompress_value_data(value.get_data());
                 }
             }
         }
@@ -511,8 +454,7 @@ impl Tree {
         for sst_path in sstables.iter().rev() {
             if let Some(value) = self.read_key_from_sstable(sst_path, key) {
                 if !value.is_expired() {
-                    let data = value.get_data().to_vec();
-                    return self.decompress_value_data(data);
+                    return self.decompress_value_data(value.get_data());
                 }
             }
         }
@@ -739,8 +681,8 @@ impl Tree {
         }
     }
 
-    fn decompress_value_data(&mut self, data: Vec<u8>) -> Option<Vec<u8>> {
-        match self.apply_decompression(&data) {
+    fn decompress_value_data(&self, data: &[u8]) -> Option<Vec<u8>> {
+        match self.apply_decompression(data) {
             Ok(decompressed) => Some(decompressed),
             Err(e) => {
                 log::error!("Error decompressing value: {}", e);

@@ -1,6 +1,6 @@
 [package]
 name = "redish"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Swapper9 <swapper9@gmail.com>"]
 description = "A lightweight in-memory key-value database"
@@ -34,6 +34,7 @@ crc32fast = "1.4.2"
 lz4 = "1.24"
 zstd = "0.13"
 snap = "1.1"
+chrono = "0.4.41"
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }

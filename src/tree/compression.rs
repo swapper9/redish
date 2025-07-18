@@ -279,15 +279,6 @@ impl CompressionStats {
         }
     }
 
-    /// Updates statistics with a new decompression operation.
-    ///
-    /// # Arguments
-    /// * `time_ms` - Time taken for the decompression operation in milliseconds
-    pub fn update_decompression(&mut self, time_ms: u128) {
-        self.decompression_operations += 1;
-        self.total_decompression_time_ms += time_ms;
-    }
-
     /// Calculates the average compression ratio.
     ///
     /// The compression ratio is the size of compressed data divided by the

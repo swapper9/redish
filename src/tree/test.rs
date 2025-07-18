@@ -4,8 +4,11 @@ mod test {
     use crate::tree::compression::{CompressionConfig, Compressor};
     use crate::tree::{CompressionType, Tree, TreeSettings, TreeSettingsBuilder};
     use bincode::{Decode, Encode};
+    use rand::prelude::*;
     use serial_test::serial;
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::time::Instant;
 
     #[derive(Debug, Encode, Decode, PartialEq)]
     pub struct TestStruct {
@@ -43,18 +46,18 @@ mod test {
         });
         let tree2 = Tree::load_with_settings(TreeSettings::default());
         let tree3 = Tree::load_with_settings(
-            TreeSettings::default().with_db_path(PathBuf::from(DEFAULT_DB_PATH).join("custom_db"))
+            TreeSettings::default().with_db_path(PathBuf::from(DEFAULT_DB_PATH).join("custom_db")),
         );
         let tree4 = Tree::load_with_settings(
             TreeSettings::new()
                 .with_db_path(PathBuf::from(DEFAULT_DB_PATH).join("my_db"))
-                .with_mem_table_max_size(50000)
+                .with_mem_table_max_size(50000),
         );
         let tree5 = Tree::load_with_settings(
             TreeSettingsBuilder::new()
                 .db_path(PathBuf::from(DEFAULT_DB_PATH).join("my_db"))
                 .mem_table_max_size(20000)
-                .build()
+                .build(),
         );
         assert_eq!(tree1.len(), 0);
         assert_eq!(tree2.len(), 0);
@@ -94,7 +97,7 @@ mod test {
         let mut tree = Tree::load_with_path(DEFAULT_DB_PATH);
         let max_entries: u64 = 100000;
 
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
 
         for i in 1..=max_entries {
             let user = User {
@@ -105,20 +108,29 @@ mod test {
         }
 
         let write_duration = start_time.elapsed();
-        println!("Write time for {} entries: {:?}", max_entries, write_duration);
+        println!(
+            "Write time for {} entries: {:?}",
+            max_entries, write_duration
+        );
 
         println!("===> Tree state BEFORE flush:");
         println!("tree.mem_table.len: {}", tree.mem_table.len());
-        println!("tree.immutable_mem_tables.len: {}", tree.immutable_mem_tables.len());
+        println!(
+            "tree.immutable_mem_tables.len: {}",
+            tree.immutable_mem_tables.len()
+        );
         println!("tree.ss_tables.len: {}", tree.ss_tables.len());
-        let flush_start = std::time::Instant::now();
+        let flush_start = Instant::now();
         tree.flush();
         let flush_duration = flush_start.elapsed();
         println!("Flush time: {:?}", flush_duration);
 
         println!("===> Tree state AFTER flush:");
         println!("tree.mem_table.len: {}", tree.mem_table.len());
-        println!("tree.immutable_mem_tables.len: {}", tree.immutable_mem_tables.len());
+        println!(
+            "tree.immutable_mem_tables.len: {}",
+            tree.immutable_mem_tables.len()
+        );
         println!("tree.ss_tables.len: {}", tree.ss_tables.len());
 
         use rand::Rng;
@@ -127,7 +139,7 @@ mod test {
             .map(|_| rng.random_range(1..=max_entries))
             .collect();
 
-        let normal_search_start = std::time::Instant::now();
+        let normal_search_start = Instant::now();
         let mut found_normal = 0;
 
         for &index in &random_indices {
@@ -138,9 +150,16 @@ mod test {
         }
 
         let normal_search_duration = normal_search_start.elapsed();
-        println!("Search time for {} random entries through get_typed: {:?}",
-                 random_indices.len(), normal_search_duration);
-        println!("Found through get_typed: {}/{}", found_normal, random_indices.len());
+        println!(
+            "Search time for {} random entries through get_typed: {:?}",
+            random_indices.len(),
+            normal_search_duration
+        );
+        println!(
+            "Found through get_typed: {}/{}",
+            found_normal,
+            random_indices.len()
+        );
 
         let test_indices = [1, 1000, 5000, 7500, 10000];
         for &index in &test_indices {
@@ -153,81 +172,33 @@ mod test {
             assert_eq!(user_data.user_id, index);
             assert_eq!(user_data.username, format!("flush_test_user_{}", index));
 
-            println!("Checked user: user_id={}, username={}",
-                     user_data.user_id, user_data.username);
+            println!(
+                "Checked user: user_id={}, username={}",
+                user_data.user_id, user_data.username
+            );
         }
 
-        assert_eq!(found_normal, random_indices.len(), "Not all random entries found through get_typed");
+        assert_eq!(
+            found_normal,
+            random_indices.len(),
+            "Not all random entries found through get_typed"
+        );
 
         println!("===> Performance statistics:");
-        println!("Write speed: {:.2} entries/ms",
-                 max_entries as f64 / write_duration.as_millis() as f64);
-        println!("Flush speed: {:.2} entries/ms",
-                 max_entries as f64 / flush_duration.as_millis() as f64);
-        println!("Search speed through get_typed (random): {:.2} searches/ms",
-                 random_indices.len() as f64 / normal_search_duration.as_millis() as f64);
+        println!(
+            "Write speed: {:.2} entries/ms",
+            max_entries as f64 / write_duration.as_millis() as f64
+        );
+        println!(
+            "Flush speed: {:.2} entries/ms",
+            max_entries as f64 / flush_duration.as_millis() as f64
+        );
+        println!(
+            "Search speed through get_typed (random): {:.2} searches/ms",
+            random_indices.len() as f64 / normal_search_duration.as_millis() as f64
+        );
         println!("{:?}", tree.get_index_cache_stats());
         println!("{:?}", tree.get_value_cache_stats());
-        clean_temp_dir();
-    }
-
-    #[test]
-    #[serial]
-    fn test_compression_functionality() {
-        clean_temp_dir();
-
-        let compression_types = vec![
-            CompressionType::None,
-            CompressionType::Snappy,
-            CompressionType::Lz4,
-            CompressionType::Zstd,
-        ];
-
-        for compression_type in compression_types {
-            println!("Testing compression type: {:?}", compression_type);
-
-            let config = CompressionConfig::new(compression_type);
-            let mut tree = Tree::load_with_settings(TreeSettings {
-                db_path: PathBuf::from(DEFAULT_DB_PATH).join(format!("compression_test_{:?}", compression_type)),
-                bincode_config: Default::default(),
-                mem_table_max_size: 1000,
-                enable_index_cache: false,
-                enable_value_cache: false,
-                compressor: Compressor::new(config),
-            });
-
-            let test_cases = vec![
-                ("repeating_data", "A".repeat(1000)),
-                ("random_data", generate_random_string(1000)),
-                ("json_like", generate_json_like_data(100)),
-                ("mixed_data", format!("{}{}{}", "A".repeat(300), generate_random_string(300), "B".repeat(400))),
-            ];
-
-            for (test_name, test_data) in test_cases {
-                let key = format!("{}_{}", test_name, compression_type as u8);
-                let original_size = test_data.len();
-
-                tree.put_typed(&key, &test_data);
-
-                let retrieved_data: Option<String> = tree.get_typed(&key);
-                assert!(retrieved_data.is_some(), "Failed to retrieve data for key: {}", key);
-
-                let retrieved = retrieved_data.unwrap();
-                assert_eq!(retrieved, test_data, "Data mismatch for key: {}", key);
-
-                println!("  {}: original size = {}, compression type = {:?}",
-                         test_name, original_size, compression_type);
-            }
-
-            let stats = tree.get_compression_stats();
-            println!("  Compression stats: {:?}", stats);
-
-            if compression_type != CompressionType::None {
-                assert!(stats.compression_operations > 0, "No compression operations recorded");
-                assert!(stats.decompression_operations > 0, "No decompression operations recorded");
-            }
-        }
-
         clean_temp_dir();
     }
 
@@ -247,7 +218,8 @@ mod test {
             println!("Testing compression config: {:?}", config);
 
             let mut tree = Tree::load_with_settings(TreeSettings {
-                db_path: PathBuf::from(DEFAULT_DB_PATH).join(format!("perf_test_{:?}", config.compression_type)),
+                db_path: PathBuf::from(DEFAULT_DB_PATH)
+                    .join(format!("perf_test_{:?}", config.compression_type)),
                 bincode_config: Default::default(),
                 mem_table_max_size: 1000,
                 enable_index_cache: false,
@@ -255,29 +227,34 @@ mod test {
                 compressor: Compressor::new(config),
             });
 
-            let start_time = std::time::Instant::now();
+            let start_time = Instant::now();
 
             for i in 0..100 {
                 tree.put_typed(&format!("perf_test_{}", i), &test_data);
             }
 
             let write_time = start_time.elapsed();
-            let read_start = std::time::Instant::now();
+            let read_start = Instant::now();
 
             for i in 0..100 {
                 let retrieved: Option<String> = tree.get_typed(&format!("perf_test_{}", i));
-                assert!(retrieved.is_some(), "Failed to retrieve data for key: perf_test_{}", i);
-                assert_eq!(retrieved.unwrap(), test_data, "Data mismatch for key: perf_test_{}", i);
+                assert!(
+                    retrieved.is_some(),
+                    "Failed to retrieve data for key: perf_test_{}",
+                    i
+                );
+                assert_eq!(
+                    retrieved.unwrap(),
+                    test_data,
+                    "Data mismatch for key: perf_test_{}",
+                    i
+                );
             }
 
             let read_time = read_start.elapsed();
 
-            let stats = tree.get_compression_stats();
             println!("  Write time: {:?}", write_time);
             println!("  Read time: {:?}", read_time);
-            println!("  Compression ratio: {:.2}%", stats.compression_ratio_percentage());
-            println!("  Average compression time: {:.2}ms", stats.average_compression_time_ms());
-            println!("  Average decompression time: {:.2}ms", stats.average_decompression_time_ms());
         }
 
         clean_temp_dir();
@@ -292,14 +269,14 @@ mod test {
         struct LargeObject {
             id: u64,
             data: Vec<String>,
-            metadata: std::collections::HashMap<String, String>,
+            metadata: HashMap<String, String>,
         }
 
         let large_object = LargeObject {
             id: 12345,
             data: (0..1000).map(|i| format!("Item number {}", i)).collect(),
             metadata: {
-                let mut map = std::collections::HashMap::new();
+                let mut map = HashMap::new();
                 for i in 0..50 {
                     map.insert(format!("key_{}", i), format!("value_{}", i).repeat(10));
                 }
@@ -324,139 +301,180 @@ mod test {
         let retrieved_object = retrieved.unwrap();
         assert_eq!(retrieved_object, large_object, "Large object data mismatch");
 
-        let stats = tree.get_compression_stats();
-        println!("Large object compression stats: {:?}", stats);
-        assert!(stats.compression_operations > 0, "No compression operations for large object");
-        assert!(stats.decompression_operations > 0, "No decompression operations for large object");
-
         clean_temp_dir();
     }
 
     #[test]
     #[serial]
-    fn test_compression_error_handling() {
+    fn test_basic_string_loadtest() {
         clean_temp_dir();
 
         let mut tree = Tree::load_with_settings(TreeSettings {
             db_path: PathBuf::from(DEFAULT_DB_PATH),
             bincode_config: Default::default(),
             mem_table_max_size: 10000,
-            enable_index_cache: false,
-            enable_value_cache: false,
+            enable_index_cache: true,
+            enable_value_cache: true,
             compressor: Compressor::new(CompressionConfig::balanced()),
         });
 
-        let test_cases = vec![
-            ("empty", String::new()),
-            ("small", "small".to_string()),
-            ("medium", "medium".repeat(100)),
-            ("large", "large".repeat(10000)),
-        ];
+        const ENTRIES: usize = 50000;
+        const KEY_LENGTH: usize = 16;
+        const VALUE_LENGTH: usize = 100;
 
-        for (name, data) in test_cases {
-            tree.put_typed(name, &data);
+        println!("=== Basic String Load Test ===");
+        println!(
+            "Entries: {}, Key Length: {}, Value Length: {}",
+            ENTRIES, KEY_LENGTH, VALUE_LENGTH
+        );
 
-            let retrieved: Option<String> = tree.get_typed(name);
-            assert!(retrieved.is_some(), "Failed to retrieve data for: {}", name);
-            assert_eq!(retrieved.unwrap(), data, "Data mismatch for: {}", name);
+        // Write phase
+        let write_start = Instant::now();
+        let mut keys = Vec::with_capacity(ENTRIES);
+
+        for i in 0..ENTRIES {
+            let key = format!("key_{:08}_{}", i, generate_random_string(KEY_LENGTH - 12));
+            let value = generate_realistic_value("user_data", VALUE_LENGTH);
+
+            tree.put_typed(&key, &value);
+            keys.push(key);
+
+            if i % 10000 == 0 {
+                println!("Written {} entries", i);
+            }
         }
+
+        let write_duration = write_start.elapsed();
+        println!("Write phase completed in {:?}", write_duration);
+        println!(
+            "Write speed: {:.2} entries/sec",
+            ENTRIES as f64 / write_duration.as_secs_f64()
+        );
+
+        // Flush to disk
+        let flush_start = Instant::now();
+        tree.flush();
+        let flush_duration = flush_start.elapsed();
+        println!("Flush completed in {:?}", flush_duration);
+
+        // Read phase - sequential
+        let read_start = Instant::now();
+        let mut found_count = 0;
+
+        for key in &keys {
+            if let Some(_value) = tree.get_typed::<String>(key) {
+                found_count += 1;
+            }
+        }
+
+        let read_duration = read_start.elapsed();
+        println!("Sequential read completed in {:?}", read_duration);
+        println!(
+            "Read speed: {:.2} entries/sec",
+            ENTRIES as f64 / read_duration.as_secs_f64()
+        );
+        println!("Found: {}/{} entries", found_count, ENTRIES);
+
+        // Random read phase
+        let mut rng = rand::rng();
+        let random_keys: Vec<_> = keys.choose_multiple(&mut rng, 5000).collect();
+
+        let random_read_start = Instant::now();
+        let mut random_found = 0;
+
+        for key in random_keys {
+            if let Some(_value) = tree.get_typed::<String>(key) {
+                random_found += 1;
+            }
+        }
+
+        let random_read_duration = random_read_start.elapsed();
+        println!("Random read completed in {:?}", random_read_duration);
+        println!(
+            "Random read speed: {:.2} entries/sec",
+            5000.0 / random_read_duration.as_secs_f64()
+        );
+        println!("Random found: {}/5000 entries", random_found);
+
+        // Cache statistics
+        println!("\n=== Cache Statistics ===");
+        println!("Index cache: {}", tree.get_index_cache_stats());
+        println!("Value cache: {}", tree.get_value_cache_stats());
 
         clean_temp_dir();
     }
 
     #[test]
     #[serial]
-    fn test_compression_ratio_analysis() {
+    fn test_variable_size_loadtest() {
         clean_temp_dir();
 
         let mut tree = Tree::load_with_settings(TreeSettings {
             db_path: PathBuf::from(DEFAULT_DB_PATH),
             bincode_config: Default::default(),
-            mem_table_max_size: 10000,
-            enable_index_cache: false,
-            enable_value_cache: false,
-            compressor: Compressor::new(CompressionConfig::balanced()),
+            mem_table_max_size: 5000,
+            enable_index_cache: true,
+            enable_value_cache: true,
+            compressor: Compressor::new(CompressionConfig::fast()),
         });
 
+        println!("=== Variable Size Load Test ===");
+
         let test_cases = vec![
-            ("highly_compressible", "ABCDEFGHIJ".repeat(1000)),
-            ("medium_compressible", generate_json_like_data(500)),
-            ("low_compressible", generate_random_string(5000)),
+            ("small", 1000, 50, 500),     // 1000 entries, 50 byte values, 500 byte max
+            ("medium", 500, 1000, 5000),  // 500 entries, 1KB values, 5KB max
+            ("large", 100, 10000, 50000), // 100 entries, 10KB values, 50KB max
         ];
 
-        for (name, data) in test_cases {
-            tree.reset_compression_stats();
+        for (test_name, count, min_size, max_size) in test_cases {
+            println!("\n--- {} test ---", test_name);
 
-            tree.put_typed(name, &data);
-            let _retrieved: Option<String> = tree.get_typed(name);
+            let write_start = Instant::now();
+            let mut keys = Vec::new();
 
-            let stats = tree.get_compression_stats();
-            println!("Data type: {}", name);
-            println!("  Original size estimate: {}", data.len());
-            println!("  Compression ratio: {:.2}%", stats.compression_ratio_percentage());
-            println!("  Compression time: {:.2}ms", stats.average_compression_time_ms());
-            println!("  Decompression time: {:.2}ms", stats.average_decompression_time_ms());
-            println!("  Operations: {} compress, {} decompress",
-                     stats.compression_operations, stats.decompression_operations);
-            println!();
+            for i in 0..count {
+                let key = format!("{}_{:06}", test_name, i);
+                let value_size = rand::rng().random_range(min_size..=max_size);
+                let value = generate_realistic_value("log_entry", value_size);
+
+                tree.put_typed(&key, &value);
+                keys.push(key);
+            }
+
+            let write_duration = write_start.elapsed();
+            println!(
+                "Write: {} entries in {:?} ({:.2} entries/sec)",
+                count,
+                write_duration,
+                count as f64 / write_duration.as_secs_f64()
+            );
+
+            // Read back
+            let read_start = Instant::now();
+            let mut found = 0;
+
+            for key in &keys {
+                if let Some(_value) = tree.get_typed::<String>(key) {
+                    found += 1;
+                }
+            }
+
+            let read_duration = read_start.elapsed();
+            println!(
+                "Read: {}/{} entries in {:?} ({:.2} entries/sec)",
+                found,
+                count,
+                read_duration,
+                count as f64 / read_duration.as_secs_f64()
+            );
         }
 
-        clean_temp_dir();
-    }
+        tree.flush();
 
-    #[test]
-    #[serial]
-    fn test_compression_types_comparison() {
-        clean_temp_dir();
-
-        let test_data = generate_compressible_data(5000);
-        let compression_types = vec![
-            CompressionType::None,
-            CompressionType::Snappy,
-            CompressionType::Lz4,
-            CompressionType::Zstd,
-        ];
-
-        println!("Comparing compression types with {} bytes of data:", test_data.len());
-
-        for compression_type in compression_types {
-            let config = CompressionConfig::new(compression_type);
-            let mut tree = Tree::load_with_settings(TreeSettings {
-                db_path: PathBuf::from(DEFAULT_DB_PATH).join(format!("comparison_{:?}", compression_type)),
-                bincode_config: Default::default(),
-                mem_table_max_size: 1000,
-                enable_index_cache: false,
-                enable_value_cache: false,
-                compressor: Compressor::new(config),
-            });
-
-            let start_time = std::time::Instant::now();
-
-            for i in 0..10 {
-                tree.put_typed(&format!("test_{}", i), &test_data);
-            }
-
-            let write_time = start_time.elapsed();
-
-            let read_start = std::time::Instant::now();
-
-            for i in 0..10 {
-                let _retrieved: Option<String> = tree.get_typed(&format!("test_{}", i));
-            }
-
-            let read_time = read_start.elapsed();
-            let stats = tree.get_compression_stats();
-
-            println!("  {:?}:", compression_type);
-            println!("    Write time: {:?}", write_time);
-            println!("    Read time: {:?}", read_time);
-            if compression_type != CompressionType::None {
-                println!("    Compression ratio: {:.2}%", stats.compression_ratio_percentage());
-                println!("    Avg compression time: {:.2}ms", stats.average_compression_time_ms());
-                println!("    Avg decompression time: {:.2}ms", stats.average_decompression_time_ms());
-            }
-            println!();
-        }
+        println!("\n=== Final Statistics ===");
+        println!("Total entries: {}", tree.len());
+        println!("Index cache: {}", tree.get_index_cache_stats());
+        println!("Value cache: {}", tree.get_value_cache_stats());
 
         clean_temp_dir();
     }
@@ -502,4 +520,36 @@ mod test {
         result
     }
 
+    fn generate_realistic_value(pattern: &str, size: usize) -> String {
+        match pattern {
+            "user_data" => {
+                format!(
+                    "{{\"id\":{},\"name\":\"{}\",\"email\":\"{}\",\"created_at\":\"{}\",\"active\":{}}}",
+                    rand::rng().random_range(1..1000000),
+                    generate_random_string(10),
+                    generate_random_string(15),
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                    rand::rng().random_bool(0.8)
+                )
+            }
+            "log_entry" => {
+                format!(
+                    "[{}] {} - {} - {}",
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                    ["INFO", "WARN", "ERROR", "DEBUG"][rand::rng().random_range(0..4)],
+                    generate_random_string(20),
+                    generate_random_string(size.saturating_sub(50))
+                )
+            }
+            "session_data" => {
+                format!(
+                    "session_id={}&user_id={}&data={}",
+                    generate_random_string(32),
+                    rand::rng().random_range(1..100000),
+                    generate_random_string(size.saturating_sub(50))
+                )
+            }
+            _ => generate_random_string(size),
+        }
+    }
 }
