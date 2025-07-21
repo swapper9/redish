@@ -1,14 +1,21 @@
 use crate::config::{CURRENT_VERSION, FOOTER_MAGIC_NUMBER, FOOTER_SIZE, HEADER_MAGIC_NUMBER};
-use crate::{Tree, DataValue, util};
+use crate::tree::BloomFilter;
+use crate::{util, DataValue, Tree};
 use crc32fast::Hasher;
+use growable_bloom_filter::GrowableBloom;
 use log::error;
+use std::cmp::PartialEq;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 impl Tree {
-    pub(crate) fn read_key_from_sstable(&mut self, path: &PathBuf, key: &[u8]) -> Option<DataValue> {
+    pub(crate) fn read_key_from_sstable(
+        &mut self,
+        path: &PathBuf,
+        key: &[u8],
+    ) -> Option<DataValue> {
         if self.settings.enable_value_cache {
             if let Some(cached_value) = self.value_cache.get(path, key) {
                 if !cached_value.is_expired() {
@@ -27,9 +34,13 @@ impl Tree {
                     match self.read_data_entry(&mut reader, offset) {
                         Ok(data_value) => {
                             if self.settings.enable_value_cache {
-                                self.value_cache.put(path.clone(), key.to_vec(), data_value.clone());
+                                self.value_cache.put(
+                                    path.clone(),
+                                    key.to_vec(),
+                                    data_value.clone(),
+                                );
                             }
-                            return Some(data_value)
+                            return Some(data_value);
                         }
                         Err(e) => {
                             error!("Error reading data entry from SSTable {:?}: {}", path, e);
@@ -39,6 +50,10 @@ impl Tree {
             }
         }
 
+        if !self.check_bloom_filter(key, path) {
+            return None;
+        }
+
         let file = File::open(path).ok()?;
         let mut reader = BufReader::new(file);
 
@@ -46,7 +61,7 @@ impl Tree {
             return None;
         }
 
-        let index_offset = self.read_footer(&mut reader).ok()?;
+        let (index_offset, _) = self.read_footer(&mut reader).ok()?;
         let data_offset = self.find_key_in_index(&mut reader, index_offset, key)?;
 
         if self.settings.enable_index_cache {
@@ -58,13 +73,46 @@ impl Tree {
         match self.read_data_entry(&mut reader, data_offset) {
             Ok(data_value) => {
                 if self.settings.enable_value_cache {
-                    self.value_cache.put(path.clone(), key.to_vec(), data_value.clone());
+                    self.value_cache
+                        .put(path.clone(), key.to_vec(), data_value.clone());
                 }
                 Some(data_value)
             }
             Err(e) => {
-                log::error!("Error reading data entry from SSTable {:?} with offset {:?}: {}", path, data_offset, e);
+                log::error!(
+                    "Error reading data entry from SSTable {:?} with offset {:?}: {}",
+                    path,
+                    data_offset,
+                    e
+                );
                 None
+            }
+        }
+    }
+
+    fn check_bloom_filter(&mut self, key: &[u8], path: &PathBuf) -> bool {
+        if self.settings.enable_bloom_filter_cache {
+            if let Some(bf) = self.bloom_filters
+                .iter()
+                .find(|bf| bf.path == *path) {
+                return bf.bloom_filter.contains(key)
+            }
+        }
+
+        match self.load_bloom_filter(path) {
+            Ok(bloom_filter) => {
+                let contains_key = bloom_filter.contains(key);
+                if self.settings.enable_bloom_filter_cache {
+                    self.bloom_filters.push(BloomFilter {
+                        path: path.clone(),
+                        bloom_filter,
+                    });
+                }
+                contains_key
+            }
+            Err(e) => {
+                log::error!("Error loading SSTable {:?} for bloom filter check: {}", path, e);
+                false
             }
         }
     }
@@ -98,12 +146,16 @@ impl Tree {
         Ok(())
     }
 
-    fn read_footer(&self, reader: &mut BufReader<File>) -> std::io::Result<u64> {
+    fn read_footer(&self, reader: &mut BufReader<File>) -> std::io::Result<(u64, u64)> {
         reader.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
 
         let mut index_offset_bytes = [0u8; 8];
         reader.read_exact(&mut index_offset_bytes)?;
         let index_offset = u64::from_le_bytes(index_offset_bytes);
+
+        let mut bloom_offset_bytes = [0u8; 8];
+        reader.read_exact(&mut bloom_offset_bytes)?;
+        let bloom_offset = u64::from_le_bytes(bloom_offset_bytes);
 
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
@@ -115,7 +167,7 @@ impl Tree {
             ));
         }
 
-        Ok(index_offset)
+        Ok((index_offset, bloom_offset))
     }
 
     fn read_index(
@@ -149,7 +201,28 @@ impl Tree {
         Ok(index)
     }
 
-    pub(crate) fn load_sstable(&self, path: &PathBuf) -> BTreeMap<Vec<u8>, DataValue> {
+    pub(crate) fn load_sstable(&mut self, path: &PathBuf) -> BTreeMap<Vec<u8>, DataValue> {
+        match self.load_sstable_with_bloom_filter(path) {
+            Ok((table, bloom_filter)) => {
+                if self.settings.enable_bloom_filter_cache {
+                    self.bloom_filters.push(BloomFilter {
+                        path: path.clone(),
+                        bloom_filter,
+                    });
+                }
+                table
+            },
+            Err(e) => {
+                log::error!("Error loading SSTable {:?}: {}", path, e);
+                BTreeMap::new()
+            }
+        }
+    }
+
+    pub(crate) fn load_sstable_with_bloom_filter(
+        &self,
+        path: &PathBuf,
+    ) -> Result<(BTreeMap<Vec<u8>, DataValue>, GrowableBloom), std::io::Error> {
         let mut table = BTreeMap::new();
 
         match File::open(path) {
@@ -157,23 +230,26 @@ impl Tree {
                 let mut reader = BufReader::new(file);
 
                 if let Err(e) = self.validate_header(&mut reader) {
-                    log::error!("Wrong header SSTable {:?}: {}", path, e);
-                    return table;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Wrong header SSTable {:?}: {}", path, e)));
                 }
 
-                let index_offset = match self.read_footer(&mut reader) {
+                let (index_offset, bloom_offset) = match self.read_footer(&mut reader) {
                     Ok(offsets) => offsets,
                     Err(e) => {
-                        log::error!("Error reading footer SSTable {:?}: {}", path, e);
-                        return table;
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Error reading footer SSTable {:?}: {}", path, e)));
                     }
                 };
 
                 let index = match self.read_index(&mut reader, index_offset) {
                     Ok(idx) => idx,
                     Err(e) => {
-                        log::error!("Error reading index SSTable {:?}: {}", path, e);
-                        return table;
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Error reading index SSTable {:?}: {}", path, e)));
                     }
                 };
 
@@ -182,16 +258,73 @@ impl Tree {
                         table.insert(key, value);
                     }
                 }
+
+                let bloom_filter = match self.read_bloom_filter(&mut reader, bloom_offset) {
+                    Ok(bloom_filter) => bloom_filter,
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Error reading bloom filter SSTable {:?}: {}", path, e)));
+                    }
+                };
+
+                Ok((table, bloom_filter))
+
             }
             Err(e) => {
-                log::error!("Error opening SSTable {:?}: {}", path, e);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Error opening SSTable {:?}: {}", path, e)))
             }
         }
-
-        table
     }
 
-    pub(crate) fn write_sstable(&mut self, table: &BTreeMap<Vec<u8>, DataValue>) -> Result<PathBuf, std::io::Error> {
+    pub(crate) fn load_bloom_filter(
+        &self,
+        path: &PathBuf,
+    ) -> Result<GrowableBloom, std::io::Error> {
+        match File::open(path) {
+            Ok(file) => {
+                let mut reader = BufReader::new(file);
+
+                if let Err(e) = self.validate_header(&mut reader) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Wrong header SSTable {:?}: {}", path, e)));
+                }
+
+                let (_, bloom_offset) = match self.read_footer(&mut reader) {
+                    Ok(offsets) => offsets,
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Error reading footer SSTable {:?}: {}", path, e)));
+                    }
+                };
+
+                let bloom_filter = match self.read_bloom_filter(&mut reader, bloom_offset) {
+                    Ok(bloom_filter) => bloom_filter,
+                    Err(e) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("Error reading bloom filter SSTable {:?}: {}", path, e)));
+                    }
+                };
+
+                Ok(bloom_filter)
+            }
+            Err(e) => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Error opening SSTable {:?}: {}", path, e)))
+            }
+        }
+    }
+
+    pub(crate) fn write_sstable(
+        &mut self,
+        table: &BTreeMap<Vec<u8>, DataValue>,
+    ) -> Result<(PathBuf, GrowableBloom), std::io::Error> {
         let new_sstable_number = match util::find_last_sstable_number(&self.settings.db_path) {
             None => 0,
             Some(number) => number + 1,
@@ -210,24 +343,29 @@ impl Tree {
         self.write_header(&mut writer)?;
 
         let mut index = BTreeMap::new();
+        let mut bloom_filter =
+            GrowableBloom::new(self.settings.bloom_filter_error_probability, table.len());
 
         for (key, value) in table {
             let offset = writer.stream_position()?;
             self.write_data_entry(&mut writer, key, value)?;
-
             index.insert(key.clone(), offset);
+            bloom_filter.insert(key);
         }
 
         let index_offset = writer.stream_position()?;
         self.write_index(&mut writer, &index)?;
 
-        self.write_footer(&mut writer, index_offset)?;
+        let bloom_offset = writer.stream_position()?;
+        self.write_bloom_filter(&mut writer, &bloom_filter)?;
+
+        self.write_footer(&mut writer, index_offset, bloom_offset)?;
 
         writer.flush()?;
         if self.settings.enable_index_cache {
             self.index_cache.put(table_path.clone(), index);
         }
-        Ok(table_path)
+        Ok((table_path, bloom_filter))
     }
 
     fn write_header(&self, writer: &mut BufWriter<File>) -> std::io::Result<()> {
@@ -275,8 +413,56 @@ impl Tree {
         Ok(())
     }
 
-    fn write_footer(&self, writer: &mut BufWriter<File>, index_offset: u64) -> std::io::Result<()> {
+    fn write_bloom_filter(
+        &self,
+        writer: &mut BufWriter<File>,
+        bloom_filter: &GrowableBloom,
+    ) -> std::io::Result<()> {
+        match serde_json::to_vec(bloom_filter) {
+            Ok(serialized_data) => {
+                let size = serialized_data.len();
+                writer.write_all(&(size as u32).to_le_bytes())?;
+                writer.write_all(&serialized_data)?;
+                Ok(())
+            }
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to serialize bloom filter: {}", e),
+            )),
+        }
+    }
+
+    fn read_bloom_filter(
+        &self,
+        reader: &mut BufReader<File>,
+        offset: u64,
+    ) -> std::io::Result<GrowableBloom> {
+        reader.seek(SeekFrom::Start(offset))?;
+
+        let mut size_bytes = [0u8; 4];
+        reader.read_exact(&mut size_bytes)?;
+        let size = u32::from_le_bytes(size_bytes) as usize;
+
+        let mut serialized_data = vec![0u8; size];
+        reader.read_exact(&mut serialized_data)?;
+
+        match serde_json::from_slice(&serialized_data) {
+            Ok(bloom_filter) => Ok(bloom_filter),
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to deserialize bloom filter: {}", e),
+            )),
+        }
+    }
+
+    fn write_footer(
+        &self,
+        writer: &mut BufWriter<File>,
+        index_offset: u64,
+        bloom_filter_offset: u64,
+    ) -> std::io::Result<()> {
         writer.write_all(&index_offset.to_le_bytes())?;
+        writer.write_all(&bloom_filter_offset.to_le_bytes())?;
         writer.write_all(FOOTER_MAGIC_NUMBER)?;
         Ok(())
     }
@@ -361,20 +547,25 @@ impl Tree {
             }
         }
 
-        let new_table_path = match self.write_sstable(&merged_data) {
-            Ok(path) => path,
+        match self.write_sstable(&merged_data) {
+            Ok((path, bloom_filter)) => {
+                self.ss_tables.push(path.clone());
+                if self.settings.enable_bloom_filter_cache {
+                    self.bloom_filters.push(BloomFilter { path, bloom_filter })
+                }
+            }
             Err(e) => {
                 log::error!("Error writing merged SSTable: {}", e);
                 return;
             }
         };
-        self.ss_tables.push(new_table_path.clone());
 
         for path in tables_to_merge {
             if let Err(e) = std::fs::remove_file(&path) {
                 log::error!("Error deleting old SSTable {:?}: {}", path, e);
             }
             self.ss_tables.retain(|p| p != &path);
+            self.bloom_filters.retain(|bf| bf.path != path);
         }
     }
 

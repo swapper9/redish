@@ -19,15 +19,22 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+use growable_bloom_filter::GrowableBloom;
 
 static INIT: Lazy<()> = Lazy::new(|| {
     logger::init_logger().expect("Logger was not initialized!");
 });
 
+pub struct BloomFilter {
+    path: PathBuf,
+    bloom_filter: GrowableBloom
+}
+
 pub struct Tree {
     mem_table: BTreeMap<Vec<u8>, DataValue>,
     immutable_mem_tables: VecDeque<BTreeMap<Vec<u8>, DataValue>>,
     ss_tables: Vec<PathBuf>,
+    bloom_filters: Vec<BloomFilter>,
     settings: TreeSettings,
     index_cache: LRUIndexCache,
     value_cache: LRUValueCache,
@@ -54,6 +61,7 @@ impl Tree {
             mem_table: BTreeMap::new(),
             immutable_mem_tables: VecDeque::new(),
             ss_tables: Vec::new(),
+            bloom_filters: Vec::new(),
             settings: TreeSettings::default(),
             index_cache: LRUIndexCache::default(),
             value_cache: LRUValueCache::default(),
@@ -588,17 +596,25 @@ impl Tree {
         let sstable_count: usize = self
             .ss_tables
             .iter()
-            .map(|table_path| {
-                let table = self.load_sstable(table_path);
-                table
-                    .values()
-                    .filter(|value| !value.is_expired() || !value.is_tombstone())
-                    .count()
-            })
+            .map(|table_path| self.count_sstable_entries(table_path))
             .sum();
 
         mem_count + immutable_count + sstable_count
     }
+
+    fn count_sstable_entries(&self, path: &PathBuf) -> usize {
+        match self.load_sstable_with_bloom_filter(path) {
+            Ok((table, _)) => table
+                .values()
+                .filter(|value| !value.is_expired() && !value.is_tombstone)
+                .count(),
+            Err(e) => {
+                warn!("Error loading SSTable {:?} for counting: {}", path, e);
+                0
+            }
+        }
+    }
+
 
     /// Gets the remaining TTL for a key.
     ///
@@ -667,14 +683,21 @@ impl Tree {
             None => return,
         };
 
-        let new_sstable_path = match self.write_sstable(&immutable_table) {
-            Ok(path) => path,
+        match self.write_sstable(&immutable_table) {
+            Ok((path, bloom_filter)) => {
+                self.ss_tables.push(path.clone());
+                if self.settings.enable_bloom_filter_cache {
+                    self.bloom_filters.push(BloomFilter {
+                        path,
+                        bloom_filter,
+                    });
+                }
+            },
             Err(e) => {
                 log::error!("Error writing SSTable: {}", e);
                 return;
             }       
         };
-        self.ss_tables.push(new_sstable_path.clone());
 
         if self.ss_tables.len() > 2 {
             self.merge_sstables();

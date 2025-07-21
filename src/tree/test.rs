@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod test {
     use crate::config::{DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE};
-    use crate::tree::compression::{CompressionConfig, Compressor};
-    use crate::tree::{CompressionType, Tree, TreeSettings, TreeSettingsBuilder};
+    use crate::tree::compression::CompressionConfig;
+    use crate::tree::{Tree, TreeSettings, TreeSettingsBuilder};
     use bincode::{Decode, Encode};
     use rand::prelude::*;
     use serial_test::serial;
@@ -36,22 +36,25 @@ mod test {
     fn test_create_trees() {
         clean_temp_dir();
 
-        let tree1 = Tree::load_with_settings(TreeSettings {
-            db_path: Default::default(),
-            bincode_config: Default::default(),
-            mem_table_max_size: 1000,
-            enable_index_cache: false,
-            enable_value_cache: false,
-            compressor: Compressor::new(CompressionConfig::default()),
-        });
+        let tree1 = Tree::load_with_settings(
+            TreeSettingsBuilder::new()
+                .mem_table_max_size(1000)
+                .index_cache(false)
+                .value_cache(false)
+                .compressor(CompressionConfig::default())
+                .build(),
+        );
         let tree2 = Tree::load_with_settings(TreeSettings::default());
         let tree3 = Tree::load_with_settings(
-            TreeSettings::default().with_db_path(PathBuf::from(DEFAULT_DB_PATH).join("custom_db")),
+            TreeSettingsBuilder::new()
+                .db_path(PathBuf::from(DEFAULT_DB_PATH).join("custom_db"))
+                .build(),
         );
         let tree4 = Tree::load_with_settings(
-            TreeSettings::new()
-                .with_db_path(PathBuf::from(DEFAULT_DB_PATH).join("my_db"))
-                .with_mem_table_max_size(50000),
+            TreeSettingsBuilder::new()
+                .db_path(PathBuf::from(DEFAULT_DB_PATH).join("my_db"))
+                .mem_table_max_size(50000)
+                .build(),
         );
         let tree5 = Tree::load_with_settings(
             TreeSettingsBuilder::new()
@@ -204,6 +207,52 @@ mod test {
 
     #[test]
     #[serial]
+    fn test_read_write_100k_entries() {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(
+            TreeSettingsBuilder::new()
+                .compressor(CompressionConfig::default())
+                .mem_table_max_size(100000)
+                .build(),
+        );
+        let max_entries: u64 = 99999;
+
+        let start_time = Instant::now();
+        for i in 0..=max_entries {
+            let key = format!("test_key_{}", i);
+            tree.put(key.as_bytes().to_vec(), key.as_bytes().to_vec());
+        }
+        let write_duration = start_time.elapsed();
+        println!(
+            "Write time for {} entries: {:?}",
+            max_entries, write_duration
+        );
+
+        let start_time = Instant::now();
+        for i in 0..=max_entries {
+            let key = format!("test_key_{}", i);
+            tree.get(key.as_bytes()).unwrap();
+        }
+        let read_duration = start_time.elapsed();
+
+        println!("===> Performance statistics:");
+        println!(
+            "Write speed: {:.2} entries/ms",
+            max_entries as f64 / write_duration.as_millis() as f64
+        );
+        println!(
+            "Read speed: {:.2} entries/ms",
+            max_entries as f64 / read_duration.as_millis() as f64
+        );
+
+        println!("{}", tree.get_index_cache_stats());
+        println!("{}", tree.get_value_cache_stats());
+        clean_temp_dir();
+    }
+
+    #[test]
+    #[serial]
     fn test_compression_performance() {
         clean_temp_dir();
 
@@ -217,15 +266,19 @@ mod test {
         for config in compression_configs {
             println!("Testing compression config: {:?}", config);
 
-            let mut tree = Tree::load_with_settings(TreeSettings {
-                db_path: PathBuf::from(DEFAULT_DB_PATH)
-                    .join(format!("perf_test_{:?}", config.compression_type)),
-                bincode_config: Default::default(),
-                mem_table_max_size: 1000,
-                enable_index_cache: false,
-                enable_value_cache: false,
-                compressor: Compressor::new(config),
-            });
+            let mut tree = Tree::load_with_settings(
+                TreeSettingsBuilder::new()
+                    .db_path(
+                        PathBuf::from(DEFAULT_DB_PATH)
+                            .join(format!("perf_test_{:?}", config.compression_type)),
+                    )
+                    .mem_table_max_size(1000)
+                    .bloom_filter_error_probability(0.05)
+                    .index_cache(false)
+                    .value_cache(false)
+                    .compressor(config)
+                    .build(),
+            );
 
             let start_time = Instant::now();
 
@@ -284,14 +337,12 @@ mod test {
             },
         };
 
-        let mut tree = Tree::load_with_settings(TreeSettings {
-            db_path: PathBuf::from(DEFAULT_DB_PATH),
-            bincode_config: Default::default(),
-            mem_table_max_size: 10000,
-            enable_index_cache: false,
-            enable_value_cache: false,
-            compressor: Compressor::new(CompressionConfig::balanced()),
-        });
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+                                                    .index_cache(false)
+                                                    .value_cache(false)
+                                                    .compressor(CompressionConfig::balanced())
+            .build()
+        );
 
         tree.put_typed("large_object", &large_object);
 
@@ -309,14 +360,9 @@ mod test {
     fn test_basic_string_loadtest() {
         clean_temp_dir();
 
-        let mut tree = Tree::load_with_settings(TreeSettings {
-            db_path: PathBuf::from(DEFAULT_DB_PATH),
-            bincode_config: Default::default(),
-            mem_table_max_size: 10000,
-            enable_index_cache: true,
-            enable_value_cache: true,
-            compressor: Compressor::new(CompressionConfig::balanced()),
-        });
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .compressor(CompressionConfig::balanced())
+            .build());
 
         const ENTRIES: usize = 50000;
         const KEY_LENGTH: usize = 16;
@@ -409,14 +455,13 @@ mod test {
     fn test_variable_size_loadtest() {
         clean_temp_dir();
 
-        let mut tree = Tree::load_with_settings(TreeSettings {
-            db_path: PathBuf::from(DEFAULT_DB_PATH),
-            bincode_config: Default::default(),
-            mem_table_max_size: 5000,
-            enable_index_cache: true,
-            enable_value_cache: true,
-            compressor: Compressor::new(CompressionConfig::fast()),
-        });
+        let mut tree = Tree::load_with_settings(
+            TreeSettingsBuilder::new()
+                .mem_table_max_size(5000)
+                .bloom_filter_cache(true)
+                .compressor(CompressionConfig::fast())
+                .build()
+        );
 
         println!("=== Variable Size Load Test ===");
 
@@ -448,7 +493,7 @@ mod test {
                 write_duration,
                 count as f64 / write_duration.as_secs_f64()
             );
-
+            tree.flush();
             // Read back
             let read_start = Instant::now();
             let mut found = 0;
@@ -469,8 +514,6 @@ mod test {
             );
         }
 
-        tree.flush();
-
         println!("\n=== Final Statistics ===");
         println!("Total entries: {}", tree.len());
         println!("Index cache: {}", tree.get_index_cache_stats());
@@ -487,6 +530,7 @@ mod test {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn generate_json_like_data(count: usize) -> String {
         let mut result = String::from("[");
         for i in 0..count {
