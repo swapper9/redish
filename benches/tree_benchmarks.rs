@@ -1,5 +1,6 @@
 use bincode::{Decode, Encode};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
 use redish::tree::Tree;
 use std::time::Duration;
 
@@ -34,7 +35,6 @@ fn bench_put_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("put_operations");
     group.measurement_time(Duration::from_secs(20));
 
-    // Бенчмарк для различных размеров данных
     for size in [100, 1000, 10000].iter() {
         group.throughput(Throughput::Elements(*size as u64));
 
@@ -75,7 +75,6 @@ fn bench_get_operations(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_operations");
     group.measurement_time(Duration::from_secs(10));
 
-    // Предварительно заполняем данные
     let mut tree = setup_tree();
     for i in 0..10000 {
         let user = User::new(i);

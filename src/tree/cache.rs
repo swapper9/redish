@@ -187,6 +187,23 @@ impl LRUValueCache {
             self.remove(&key.sstable_path, &key.key);
         }
     }
+    
+    pub(crate) fn rename_sstable(&mut self, old_path: &PathBuf, new_path: &PathBuf) {
+        let keys_to_rename: Vec<CacheKey> = self
+            .cache
+            .keys()
+            .filter(|k| &k.sstable_path == old_path)
+            .cloned()
+            .collect();
+
+        for old_key in keys_to_rename {
+            if let Some(value) = self.cache.remove(&old_key) {
+                let mut new_key = old_key;
+                new_key.sstable_path = new_path.clone();
+                self.cache.insert(new_key, value);
+            }
+        }
+    }
 
     fn move_to_back(&mut self, cache_key: &CacheKey) {
         if let Some(pos) = self.lru_queue.iter().position(|k| k == cache_key) {
@@ -498,10 +515,11 @@ impl LRUIndexCache {
         self.current_memory_usage += index_size;
     }
 
-    pub(crate) fn remove(&mut self, path: &PathBuf) {
+    pub(crate) fn remove(&mut self, path: &PathBuf) -> Option<BTreeMap<Vec<u8>, u64>> {
         if self.cache.contains_key(path) {
-            self.cache.remove(path);
+            return self.cache.remove(path);
         }
+        None
     }
 
     pub(crate) fn stats(&self) -> CacheStats {

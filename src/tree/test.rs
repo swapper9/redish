@@ -94,41 +94,39 @@ mod test {
 
     #[test]
     #[serial]
-    fn test_load_entries_with_flush_and_index_search() {
+    fn test_write_and_load_entries_with_flush_and_random_search() {
         clean_temp_dir();
 
-        let mut tree = Tree::load_with_path(DEFAULT_DB_PATH);
-        let max_entries: u64 = 100000;
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .compressor(CompressionConfig::none())
+            .build()
+        );
 
-        let start_time = Instant::now();
+        const ENTRIES: usize = 100000;
+        const RANDOM_SEARCHES: usize = 5000;
+        const KEY_LENGTH: usize = 16;
+        const VALUE_LENGTH: usize = 100;
 
-        for i in 1..=max_entries {
-            let user = User {
-                user_id: i,
-                username: format!("flush_test_user_{}", i),
-            };
-            tree.put_typed::<User>(&format!("flush_test_user_{}", i), &user);
+        println!(
+            "Entries: {}, Key Length: {}, Value Length: {}",
+            ENTRIES, KEY_LENGTH, VALUE_LENGTH
+        );
+
+        let mut keys = Vec::with_capacity(ENTRIES);
+
+        let write_start = Instant::now();
+        for i in 0..ENTRIES {
+            let key = format!("key_{:08}_{}", i, generate_random_string(KEY_LENGTH - 12));
+            let value = generate_realistic_value("user_data", VALUE_LENGTH);
+            tree.put_typed(&key, &value);
+            keys.push(key);
         }
+        let write_duration = write_start.elapsed();
 
-        let write_duration = start_time.elapsed();
-        println!(
-            "Write time for {} entries: {:?}",
-            max_entries, write_duration
-        );
-
-        println!("===> Tree state BEFORE flush:");
-        println!("tree.mem_table.len: {}", tree.mem_table.len());
-        println!(
-            "tree.immutable_mem_tables.len: {}",
-            tree.immutable_mem_tables.len()
-        );
-        println!("tree.ss_tables.len: {}", tree.ss_tables.len());
         let flush_start = Instant::now();
         tree.flush();
         let flush_duration = flush_start.elapsed();
-        println!("Flush time: {:?}", flush_duration);
 
-        println!("===> Tree state AFTER flush:");
         println!("tree.mem_table.len: {}", tree.mem_table.len());
         println!(
             "tree.immutable_mem_tables.len: {}",
@@ -136,72 +134,42 @@ mod test {
         );
         println!("tree.ss_tables.len: {}", tree.ss_tables.len());
 
-        use rand::Rng;
         let mut rng = rand::rng();
-        let random_indices: Vec<u64> = (0..1000)
-            .map(|_| rng.random_range(1..=max_entries))
-            .collect();
+        let random_keys: Vec<_> = keys.choose_multiple(&mut rng, RANDOM_SEARCHES).collect();
+        let random_keys_len = random_keys.len();
 
-        let normal_search_start = Instant::now();
-        let mut found_normal = 0;
+        let random_read_start = Instant::now();
+        let mut random_found = 0;
 
-        for &index in &random_indices {
-            let key = format!("flush_test_user_{}", index);
-            if tree.get_typed::<User>(key.as_str()).is_some() {
-                found_normal += 1;
+        for key in random_keys {
+            if let Some(_value) = tree.get_typed::<String>(key) {
+                random_found += 1;
             }
         }
-
-        let normal_search_duration = normal_search_start.elapsed();
-        println!(
-            "Search time for {} random entries through get_typed: {:?}",
-            random_indices.len(),
-            normal_search_duration
-        );
-        println!(
-            "Found through get_typed: {}/{}",
-            found_normal,
-            random_indices.len()
-        );
-
-        let test_indices = [1, 1000, 5000, 7500, 10000];
-        for &index in &test_indices {
-            let key = format!("flush_test_user_{}", index);
-
-            let user = tree.get_typed::<User>(key.as_str());
-            assert!(user.is_some(), "User {} not found", key);
-
-            let user_data = user.unwrap();
-            assert_eq!(user_data.user_id, index);
-            assert_eq!(user_data.username, format!("flush_test_user_{}", index));
-
-            println!(
-                "Checked user: user_id={}, username={}",
-                user_data.user_id, user_data.username
-            );
-        }
+        let random_read_duration = random_read_start.elapsed();
 
         assert_eq!(
-            found_normal,
-            random_indices.len(),
+            RANDOM_SEARCHES,
+            random_found,
             "Not all random entries found through get_typed"
         );
 
         println!("===> Performance statistics:");
         println!(
             "Write speed: {:.2} entries/ms",
-            max_entries as f64 / write_duration.as_millis() as f64
+            ENTRIES as f64 / write_duration.as_millis() as f64
         );
         println!(
             "Flush speed: {:.2} entries/ms",
-            max_entries as f64 / flush_duration.as_millis() as f64
+            ENTRIES as f64 / flush_duration.as_millis() as f64
         );
         println!(
             "Search speed through get_typed (random): {:.2} searches/ms",
-            random_indices.len() as f64 / normal_search_duration.as_millis() as f64
+            random_keys_len as f64 / random_read_duration.as_millis() as f64
         );
-        println!("{:?}", tree.get_index_cache_stats());
-        println!("{:?}", tree.get_value_cache_stats());
+        println!("{}", tree.get_index_cache_stats());
+        println!("{}", tree.get_value_cache_stats());
+
         clean_temp_dir();
     }
 

@@ -13,6 +13,13 @@ A lightweight in-memory key-value storage DB created based on LSM Tree.
 - Optional value caching
 - Optional compression (lz4, zstd or snappy)
 
+Default settings are:
+- bloom filter on
+- index caching on (100Mb cache)
+- value caching on (200Mb cache, 200k values max)
+- compression on (LZ4 level 1, "balanced")
+All these settings could be altered via TreeSettingsBuilder.
+
 ## Usage:
 
 ```

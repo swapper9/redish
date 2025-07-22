@@ -208,6 +208,19 @@ impl CompressionConfig {
     pub fn ultra() -> Self {
         Self::new(CompressionType::Zstd).with_level(19)
     }
+
+    /// Creates a new compression configuration with no compression applied.
+    ///
+    /// This method is a convenience constructor that creates a compression instance
+    /// configured to use `CompressionType::None`, meaning data will be stored
+    /// without any compression algorithm applied.
+    ///
+    /// # Returns
+    ///
+    /// A new compression instance configured for no compression.
+    pub fn none() -> Self {
+        Self::new(CompressionType::None)
+    }
 }
 
 /// Statistics tracking compression operations and performance.

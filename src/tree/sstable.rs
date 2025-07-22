@@ -567,6 +567,58 @@ impl Tree {
             self.ss_tables.retain(|p| p != &path);
             self.bloom_filters.retain(|bf| bf.path != path);
         }
+
+        if let Err(e) = self.rename_sstables_after_merge() {
+            log::error!("Error renaming SSTable files: {}", e);
+            return;
+        }
+    }
+
+    fn rename_sstables_after_merge(&mut self) -> std::io::Result<()> {
+        let mut sstables_with_numbers: Vec<(usize, PathBuf)> = Vec::new();
+
+        for path in &self.ss_tables {
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                if file_name.starts_with("sstable_") && file_name.ends_with(".sst") {
+                    let number_part = &file_name[8..file_name.len() - 4];
+                    if let Ok(number) = number_part.parse::<usize>() {
+                        sstables_with_numbers.push((number, path.clone()));
+                    }
+                }
+            }
+        }
+
+        if sstables_with_numbers[0].0 > self.ss_tables.len() {
+            let mut updated_paths = Vec::new();
+            for (new_index, (_, old_path)) in sstables_with_numbers.into_iter().enumerate() {
+                let new_name = format!("sstable_{}.sst", new_index);
+                let new_path = old_path.parent().unwrap().join(&new_name);
+
+                if old_path != new_path {
+                    std::fs::rename(&old_path, &new_path)?;
+
+                    if self.settings.enable_index_cache {
+                        if let Some(cached_index) = self.index_cache.remove(&old_path) {
+                            self.index_cache.put(new_path.clone(), cached_index.clone());
+                        }
+                    }
+
+                    if self.settings.enable_value_cache {
+                        self.value_cache.rename_sstable(&old_path, &new_path);
+                    }
+
+                    for bloom_filter in &mut self.bloom_filters {
+                        if bloom_filter.path == old_path {
+                            bloom_filter.path = new_path.clone();
+                        }
+                    }
+                }
+                updated_paths.push(new_path);
+            }
+            self.ss_tables = updated_paths;
+        }
+
+        Ok(())
     }
 
     fn find_key_in_index(
