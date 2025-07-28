@@ -4,6 +4,8 @@ pub mod settings;
 mod sstable;
 mod test;
 mod compression;
+mod wal;
+mod tree_error;
 
 pub use cache::*;
 pub use compression::*;
@@ -11,15 +13,16 @@ pub use data_value::*;
 pub use settings::*;
 
 use crate::config::DEFAULT_DB_PATH;
+use crate::tree::tree_error::{TreeError, TreeResult};
+use crate::tree::wal::{WalOperation, WalWriter};
 use crate::{logger, util};
 use bincode::Encode;
-use log::warn;
+use growable_bloom_filter::GrowableBloom;
+use log::{error, warn};
 use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, VecDeque};
-use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
-use growable_bloom_filter::GrowableBloom;
 
 static INIT: Lazy<()> = Lazy::new(|| {
     logger::init_logger().expect("Logger was not initialized!");
@@ -38,11 +41,15 @@ pub struct Tree {
     settings: TreeSettings,
     index_cache: LRUIndexCache,
     value_cache: LRUValueCache,
+    wal_writer: Option<WalWriter>,
 }
 
 impl Drop for Tree {
     fn drop(&mut self) {
-        self.flush();
+        if let Err(e) = self.flush() {
+            error!("Error during flush on drop: {}", e);
+        }
+        self.wal_writer = None;
     }
 }
 
@@ -53,11 +60,14 @@ impl Tree {
     ///
     /// # Returns
     /// A new Tree instance with default configuration
-    pub fn new() -> Self {
+    ///
+    /// # Errors
+    /// Returns `TreeError` if initialization fails
+    pub fn new() -> TreeResult<Self> {
         Lazy::force(&INIT);
         util::logo();
 
-        Self {
+        let mut tree = Self {
             mem_table: BTreeMap::new(),
             immutable_mem_tables: VecDeque::new(),
             ss_tables: Vec::new(),
@@ -65,7 +75,16 @@ impl Tree {
             settings: TreeSettings::default(),
             index_cache: LRUIndexCache::default(),
             value_cache: LRUValueCache::default(),
+            wal_writer: None,
+        };
+
+        if tree.settings.enable_wal {
+            if let Err(e) = tree.init_wal() {
+                error!("Error initializing WAL: {}", e);
+            }
         }
+
+        Ok(tree)
     }
 
     /// Creates a new Tree with a specific database path.
@@ -75,13 +94,16 @@ impl Tree {
     ///
     /// # Returns
     /// A new Tree instance configured with the specified path
-    pub fn new_with_path(path: &str) -> Self {
-        let mut tree = Self::new();
+    ///
+    /// # Errors
+    /// Returns `TreeError` if initialization fails
+    pub fn new_with_path(path: &str) -> TreeResult<Self> {
+        let mut tree = Self::new()?;
         tree.settings = TreeSettings {
             db_path: PathBuf::from(path),
             ..TreeSettings::default()
         };
-        tree
+        Ok(tree)
     }
 
     /// Creates a new Tree with custom settings.
@@ -91,10 +113,13 @@ impl Tree {
     ///
     /// # Returns
     /// A new Tree instance with the specified settings
-    pub fn new_with_settings(settings: TreeSettings) -> Self {
-        let mut tree = Self::new();
+    ///
+    /// # Errors
+    /// Returns `TreeError` if initialization fails
+    pub fn new_with_settings(settings: TreeSettings) -> TreeResult<Self> {
+        let mut tree = Self::new()?;
         tree.settings = settings;
-        tree
+        Ok(tree)
     }
 
     /// Retrieves statistics for the index cache.
@@ -145,21 +170,21 @@ impl Tree {
         self.value_cache.clear();
     }
 
-    fn apply_compression(&mut self, data: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn apply_compression(&mut self, data: Vec<u8>) -> TreeResult<Vec<u8>> {
         if self.settings.compressor.config.compression_type == CompressionType::None {
             Ok(data)
         } else {
-            let compressed = self.settings.compressor.compress(&data)?;
-            Ok(compressed)
+            self.settings.compressor.compress(&data)
+                .map_err(|e| TreeError::compression(format!("Compression failed: {}", e)))
         }
     }
 
-    fn apply_decompression(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn apply_decompression(&self, data: &[u8]) -> TreeResult<Vec<u8>> {
         if self.settings.compressor.config.compression_type == CompressionType::None {
             Ok(data.to_vec())
         } else {
-            let decompressed = self.settings.compressor.decompress(data)?;
-            Ok(decompressed)
+            self.settings.compressor.decompress(data)
+                .map_err(|e| TreeError::compression(format!("Decompression failed: {}", e)))
         }
     }
 
@@ -170,10 +195,13 @@ impl Tree {
     ///
     /// # Returns
     /// A new Tree instance loaded with existing data
-    pub fn load() -> Self {
-        let mut tree = Self::new();
-        tree.load_tree();
-        tree
+    ///
+    /// # Errors
+    /// Returns `TreeError` if loading fails
+    pub fn load() -> TreeResult<Self> {
+        let mut tree = Self::new()?;
+        tree.load_tree()?;
+        Ok(tree)
     }
 
     /// Creates and loads a Tree from a specific database path.
@@ -183,11 +211,14 @@ impl Tree {
     ///
     /// # Returns
     /// A new Tree instance loaded with existing data from the specified path
-    pub fn load_with_path(path: &str) -> Self {
-        let mut tree = Self::new();
+    ///
+    /// # Errors
+    /// Returns `TreeError` if loading fails
+    pub fn load_with_path(path: &str) -> TreeResult<Self> {
+        let mut tree = Self::new()?;
         tree.settings.db_path = PathBuf::from(path);
-        tree.load_tree();
-        tree
+        tree.load_tree()?;
+        Ok(tree)
     }
 
     /// Creates and loads a Tree with custom settings.
@@ -197,23 +228,27 @@ impl Tree {
     ///
     /// # Returns
     /// A new Tree instance loaded with existing data using the specified settings
-    pub fn load_with_settings(settings: TreeSettings) -> Self {
-        let mut tree = Self::new();
+    ///
+    /// # Errors
+    /// Returns `TreeError` if loading fails
+    pub fn load_with_settings(settings: TreeSettings) -> TreeResult<Self> {
+        let mut tree = Self::new()?;
         tree.settings = settings.clone();
-        tree.load_tree();
-        tree
+        tree.load_tree()?;
+        Ok(tree)
     }
 
-    fn load_tree(&mut self) {
+    fn load_tree(&mut self) -> TreeResult<()> {
         let db_path: PathBuf = if self.settings.db_path.as_os_str().is_empty() {
             PathBuf::from(DEFAULT_DB_PATH)
         } else {
             self.settings.db_path.clone()
         };
         if !db_path.exists() {
-            if let Err(e) = std::fs::create_dir_all(&db_path) {
-                panic!("Error creating folder for database: {}", e);
-            }
+            std::fs::create_dir_all(&db_path)
+                .map_err(|e| TreeError::configuration(
+                    format!("Error creating database directory: {}", e)
+                ))?;
         }
 
         self.settings.db_path = db_path.clone();
@@ -221,49 +256,49 @@ impl Tree {
         self.immutable_mem_tables.clear();
         self.ss_tables.clear();
 
-        match std::fs::read_dir(&db_path) {
-            Ok(entries) => {
-                let mut sstable_files = Vec::new();
+        if self.settings.enable_wal {
+            self.recover_from_wal()?;
+        }
 
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_file() && path.extension().map_or(false, |ext| ext == "sst") {
-                            if let Some(filename) = path.file_name() {
-                                if filename.to_string_lossy().starts_with("sstable_") {
-                                    sstable_files.push(path);
-                                }
-                            }
-                        }
+        let entries = std::fs::read_dir(&db_path)
+            .map_err(|e| TreeError::IoExtended { message: format!("Error reading database folder: {}", e) })?;
+
+        let mut sstable_files = Vec::new();
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.extension().map_or(false, |ext| ext == "sst") {
+                if let Some(filename) = path.file_name() {
+                    if filename.to_string_lossy().starts_with("sstable_") {
+                        sstable_files.push(path);
                     }
                 }
-
-                sstable_files.sort_by_cached_key(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .and_then(|name| {
-                            name.strip_prefix("sstable_")?
-                                .strip_suffix(".sst")?
-                                .parse::<u64>()
-                                .ok()
-                        })
-                        .unwrap_or(0)
-                });
-
-                for sstable_path in sstable_files {
-                    if self.validate_sstable(&sstable_path) {
-                        self.ss_tables.push(sstable_path);
-                    } else {
-                        warn!("Damaged SSTable file: {:?}", sstable_path);
-                    }
-                }
-
-                self.cleanup_expired();
-            }
-            Err(e) => {
-                log::error!("Error reading database folder: {}", e);
             }
         }
+
+        sstable_files.sort_by_cached_key(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| {
+                    name.strip_prefix("sstable_")?
+                        .strip_suffix(".sst")?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(0)
+        });
+
+        for sstable_path in sstable_files {
+            if self.validate_sstable(&sstable_path) {
+                self.ss_tables.push(sstable_path);
+            } else {
+                warn!("Damaged SSTable file: {:?}", sstable_path);
+            }
+        }
+
+        self.cleanup_expired()?;
+        Ok(())
     }
 
     /// Stores a typed value in the tree without TTL.
@@ -276,11 +311,11 @@ impl Tree {
     ///
     /// # Type Parameters
     /// * `T` - The type of value to store, must implement bincode::Encode
-    pub fn put_typed<T>(&mut self, key: &str, value: &T)
+    pub fn put_typed<T>(&mut self, key: &str, value: &T) -> TreeResult<()>
     where
         T: Encode,
     {
-        self.put_typed_with_ttl_optional::<T>(key, value, None);
+        self.put_typed_with_ttl_optional::<T>(key, value, None)
     }
 
     /// Stores a typed value in the tree with a TTL.
@@ -294,21 +329,19 @@ impl Tree {
     ///
     /// # Type Parameters
     /// * `T` - The type of value to store, must implement bincode::Encode
-    pub fn put_typed_with_ttl<T>(&mut self, key: &str, value: &T, ttl: Duration)
+    pub fn put_typed_with_ttl<T>(&mut self, key: &str, value: &T, ttl: Duration) -> TreeResult<()>
     where
         T: Encode,
     {
-        self.put_typed_with_ttl_optional::<T>(key, value, Some(ttl));
+        self.put_typed_with_ttl_optional::<T>(key, value, Some(ttl))
     }
 
-    fn put_typed_with_ttl_optional<T>(&mut self, key: &str, value: &T, ttl: Option<Duration>)
+    fn put_typed_with_ttl_optional<T>(&mut self, key: &str, value: &T, ttl: Option<Duration>) -> TreeResult<()>
     where
         T: Encode,
     {
-        match bincode::encode_to_vec(value, self.settings.bincode_config) {
-            Ok(serialized) => self.put_with_ttl(key.as_bytes().to_vec(), serialized, ttl),
-            Err(e) => log::error!("Error serializing value for key '{}': {}", key, e),
-        }
+        let serialized = bincode::encode_to_vec(value, self.settings.bincode_config)?;
+        self.put_with_ttl(key.as_bytes().to_vec(), serialized, ttl)
     }
 
     /// Stores raw bytes in the tree without TTL.
@@ -316,8 +349,8 @@ impl Tree {
     /// # Arguments
     /// * `key` - The key as a byte vector
     /// * `value` - The value as a byte vector
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.put_with_ttl(key, value, None);
+    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> TreeResult<()> {
+        self.put_with_ttl(key, value, None)
     }
 
     /// Stores raw bytes in the tree with optional TTL.
@@ -326,8 +359,8 @@ impl Tree {
     /// * `key` - The key as a byte vector
     /// * `value` - The value as a byte vector
     /// * `ttl` - Optional time-to-live duration
-    pub fn put_with_ttl(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) {
-        self.put_to_tree(key, value, ttl);
+    pub fn put_with_ttl(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) -> TreeResult<()> {
+        self.put_to_tree(key, value, ttl)
     }
 
     /// Stores raw bytes directly in the tree structure.
@@ -339,18 +372,15 @@ impl Tree {
     /// * `key` - The key as a byte vector
     /// * `value` - The value as a byte vector
     /// * `ttl` - Optional time-to-live duration
-    pub fn put_to_tree(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) {
-        let data = match self.apply_compression(value.to_vec()) {
-            Ok(data) => data,
-            Err(e) => {
-                log::error!("Error compressing value for key '{:?}': {}", key, e);
-                return;
-            }
-        };
-        self.mem_table.insert(key, DataValue::new(data, ttl));
+    pub fn put_to_tree(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) -> TreeResult<()> {
+        let data = self.apply_compression(value)?;
+        let data_value = DataValue::new(data, ttl);
+        self.write_to_wal(WalOperation::Put, &key, Some(&data_value))?;
+        self.mem_table.insert(key, data_value);
         if self.mem_table.len() > self.settings.mem_table_max_size {
-            self.flush_mem_table();
+            self.flush_mem_table()?;
         }
+        Ok(())
     }
 
     /// Retrieves and deserializes a typed value from the tree.
@@ -363,18 +393,17 @@ impl Tree {
     ///
     /// # Returns
     /// `Some(T)` if the key exists and can be deserialized, `None` otherwise
-    pub fn get_typed<T>(&mut self, key: &str) -> Option<T>
+    pub fn get_typed<T>(&mut self, key: &str) -> TreeResult<Option<T>>
     where
         T: bincode::Decode<()>,
     {
         let key_bytes = key.as_bytes();
-        let value_bytes = self.get(key_bytes)?;
-        match bincode::decode_from_slice(&value_bytes, self.settings.bincode_config) {
-            Ok((decoded, _)) => Some(decoded),
-            Err(e) => {
-                log::error!("Error deserializing value for key '{}': {}", key, e);
-                None
+        match self.get(key_bytes)? {
+            Some(value_bytes) => {
+                let (decoded, _) = bincode::decode_from_slice(&value_bytes, self.settings.bincode_config)?;
+                Ok(Some(decoded))
             }
+            None => Ok(None),
         }
     }
 
@@ -408,13 +437,15 @@ impl Tree {
     /// # See Also
     /// - [`get_typed`] - For retrieving a single typed value
     /// - [`get_vec`] - For retrieving multiple raw byte values
-    pub fn multi_get_typed<T>(&mut self, keys: Vec<&str>) -> Vec<Option<T>>
+    pub fn multi_get_typed<T>(&mut self, keys: Vec<&str>) -> TreeResult<Vec<Option<T>>>
     where
         T: bincode::Decode<()>,
     {
-        keys.into_iter()
-            .map(|key| self.get_typed::<T>(key))
-            .collect()
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.get_typed::<T>(key)?);
+        }
+        Ok(results)
     }
 
     /// Retrieves multiple raw byte values from the tree in a single operation.
@@ -429,8 +460,12 @@ impl Tree {
     /// A `Vec<Option<Vec<u8>>>` where each element corresponds to the key at the
     /// same index in the input vector. `Some(Vec<u8>)` if the key exists and is valid,
     /// `None` otherwise.
-    pub fn multi_get(&mut self, keys: Vec<&[u8]>) -> Vec<Option<Vec<u8>>> {
-        keys.into_iter().map(|key| self.get(key)).collect()
+    pub fn multi_get(&mut self, keys: Vec<&[u8]>) -> TreeResult<Vec<Option<Vec<u8>>>> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.get(key)?);
+        }
+        Ok(results)
     }
 
     /// Retrieves raw bytes from the tree.
@@ -443,17 +478,17 @@ impl Tree {
     ///
     /// # Returns
     /// `Some(Vec<u8>)` if the key exists and is valid, `None` otherwise
-    pub fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn get(&mut self, key: &[u8]) -> TreeResult<Option<Vec<u8>>> {
         if let Some(value) = self.mem_table.get(key) {
             if !value.is_expired() {
-                return self.decompress_value_data(value.get_data());
+                return Ok(self.decompress_value_data(value.get_data())?);
             }
         }
 
         for immutable_mem_table in self.immutable_mem_tables.iter().rev() {
             if let Some(value) = immutable_mem_table.get(key) {
                 if !value.is_expired() {
-                    return self.decompress_value_data(value.get_data());
+                    return Ok(self.decompress_value_data(value.get_data())?);
                 }
             }
         }
@@ -462,12 +497,12 @@ impl Tree {
         for sst_path in sstables.iter().rev() {
             if let Some(value) = self.read_key_from_sstable(sst_path, key) {
                 if !value.is_expired() {
-                    return self.decompress_value_data(value.get_data());
+                    return Ok(self.decompress_value_data(value.get_data())?);
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 
     /// Gets a mutable reference to a value in the memory table.
@@ -490,12 +525,13 @@ impl Tree {
     ///
     /// # Returns
     /// `true` if the key existed and was marked for deletion, `false` otherwise
-    pub fn delete(&mut self, key: &[u8]) -> bool {
-        if self.contains_key(key) {
+    pub fn delete(&mut self, key: &[u8]) -> TreeResult<bool> {
+        if self.contains_key(key)? {
+            self.write_to_wal(WalOperation::Delete, key, None)?;
             self.mem_table.insert(key.to_vec(), DataValue::tombstone());
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
@@ -537,7 +573,7 @@ impl Tree {
     ///
     /// This method scans through all memory tables and removes entries
     /// that have exceeded their TTL.
-    pub fn cleanup_expired(&mut self) {
+    pub fn cleanup_expired(&mut self) -> TreeResult<()> {
         let expired_keys: Vec<Vec<u8>> = self
             .mem_table
             .iter()
@@ -560,6 +596,7 @@ impl Tree {
                 mem_table.remove(&key);
             }
         }
+        Ok(())
     }
 
     /// Checks if a key exists in the tree.
@@ -569,8 +606,8 @@ impl Tree {
     ///
     /// # Returns
     /// `true` if the key exists and is valid, `false` otherwise
-    pub fn contains_key(&mut self, key: &[u8]) -> bool {
-        self.get(key).is_some()
+    pub fn contains_key(&mut self, key: &[u8]) -> TreeResult<bool> {
+        Ok(self.get(key)?.is_some())
     }
 
     /// Returns the number of active (non-expired) entries in the tree.
@@ -596,21 +633,28 @@ impl Tree {
         let sstable_count: usize = self
             .ss_tables
             .iter()
-            .map(|table_path| self.count_sstable_entries(table_path))
+            .map(|table_path| {
+                match self.count_sstable_entries(table_path) {
+                    Ok(count) => count,
+                    Err(e) => {
+                        error!("Error counting entries in SSTable {:?}: {}", table_path, e);
+                        0
+                    }
+                }
+            })
             .sum();
 
         mem_count + immutable_count + sstable_count
     }
 
-    fn count_sstable_entries(&self, path: &PathBuf) -> usize {
+    fn count_sstable_entries(&self, path: &PathBuf) -> TreeResult<usize> {
         match self.load_sstable_with_bloom_filter(path) {
-            Ok((table, _)) => table
+            Ok((table, _)) => Ok(table
                 .values()
                 .filter(|value| !value.is_expired() && !value.is_tombstone)
-                .count(),
+                .count()),
             Err(e) => {
-                warn!("Error loading SSTable {:?} for counting: {}", path, e);
-                0
+                Err(TreeError::internal(format!("Failed to count SSTable entries: {}", e)))
             }
         }
     }
@@ -646,70 +690,72 @@ impl Tree {
     ///
     /// # Returns
     /// `true` if the key was found and updated, `false` otherwise
-    pub fn update_ttl(&mut self, key: &[u8], new_ttl: Option<Duration>) -> bool {
+    pub fn update_ttl(&mut self, key: &[u8], new_ttl: Option<Duration>) -> TreeResult<bool> {
         if let Some(mut value) = self.mem_table.remove(key) {
             if !value.is_expired() {
                 value.expires_at = new_ttl.map(|duration| SystemTime::now() + duration);
                 self.mem_table.insert(key.to_vec(), value);
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     /// Flushes the current memory table to disk.
     ///
     /// This forces all data in the active memory table to be written
     /// to an SSTable file on disk.
-    pub fn flush(&mut self) {
+    pub fn flush(&mut self) -> TreeResult<()> {
         if !self.mem_table.is_empty() {
-            self.flush_mem_table();
+            self.flush_mem_table()?;
         }
+        Ok(())
     }
 
-    fn flush_mem_table(&mut self) {
+    fn flush_mem_table(&mut self) -> TreeResult<()> {
         let immutable = std::mem::take(&mut self.mem_table);
         self.immutable_mem_tables.push_back(immutable);
-        self.compact();
+        self.compact()
     }
 
-    fn compact(&mut self) {
+    fn compact(&mut self) -> TreeResult<()> {
         if self.immutable_mem_tables.is_empty() {
-            return;
+            return Ok(());
         }
 
         let immutable_table = match self.immutable_mem_tables.pop_front() {
             Some(table) => table,
-            None => return,
+            None => return Ok(()),
         };
 
-        match self.write_sstable(&immutable_table) {
-            Ok((path, bloom_filter)) => {
-                self.ss_tables.push(path.clone());
-                if self.settings.enable_bloom_filter_cache {
-                    self.bloom_filters.push(BloomFilter {
-                        path,
-                        bloom_filter,
-                    });
-                }
-            },
-            Err(e) => {
-                log::error!("Error writing SSTable: {}", e);
-                return;
-            }       
-        };
+        let (path, bloom_filter) = self.write_sstable(&immutable_table)?;
+
+        self.ss_tables.push(path.clone());
+        if self.settings.enable_bloom_filter_cache {
+            self.bloom_filters.push(BloomFilter {
+                path,
+                bloom_filter,
+            });
+        }
+
+        if let Some(ref mut wal_writer) = self.wal_writer {
+            wal_writer.write_checkpoint()
+                .map_err(|e| TreeError::wal(format!("Failed to write checkpoint: {}", e)))?;
+        }
 
         if self.ss_tables.len() > 2 {
-            self.merge_sstables();
+            self.merge_sstables()?;
         }
+
+        Ok(())
     }
 
-    fn decompress_value_data(&self, data: &[u8]) -> Option<Vec<u8>> {
+    fn decompress_value_data(&self, data: &[u8]) -> TreeResult<Option<Vec<u8>>> {
         match self.apply_decompression(data) {
-            Ok(decompressed) => Some(decompressed),
+            Ok(decompressed) => Ok(Some(decompressed)),
             Err(e) => {
-                log::error!("Error decompressing value: {}", e);
-                None
+                error!("Error decompressing value: {}", e);
+                Err(e)
             }
         }
     }

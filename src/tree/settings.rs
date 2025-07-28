@@ -1,4 +1,4 @@
-use crate::config::{BINCODE_CONFIG, DEFAULT_BLOOM_FILTER_ERROR_PROBABILITY, DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE};
+use crate::config::{BINCODE_CONFIG, DEFAULT_BLOOM_FILTER_ERROR_PROBABILITY, DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE, DEFAULT_WAL_MAX_SIZE};
 use crate::tree::{CompressionConfig, Compressor};
 use std::path::PathBuf;
 
@@ -53,6 +53,8 @@ pub struct TreeSettings {
     pub enable_bloom_filter_cache: bool,
     pub enable_index_cache: bool,
     pub enable_value_cache: bool,
+    pub enable_wal: bool,
+    pub wal_max_size: u64,
     pub compressor: Compressor,
 }
 
@@ -66,6 +68,8 @@ impl Default for TreeSettings {
             enable_bloom_filter_cache: true,
             enable_index_cache: true,
             enable_value_cache: true,
+            enable_wal: true,
+            wal_max_size: DEFAULT_WAL_MAX_SIZE,
             compressor: Compressor::new(CompressionConfig::balanced()),
         }
     }
@@ -101,6 +105,8 @@ pub struct TreeSettingsBuilder {
     enable_bloom_filter_cache: Option<bool>,
     enable_index_cache: Option<bool>,
     enable_value_cache: Option<bool>,
+    enable_wal: Option<bool>,
+    wal_max_size: Option<u64>,
     compressor: Option<Compressor>,
 }
 
@@ -118,6 +124,8 @@ impl TreeSettingsBuilder {
             enable_bloom_filter_cache: None,
             enable_index_cache: None,
             enable_value_cache: None,
+            enable_wal: None,
+            wal_max_size: None,
             compressor: None
         }
     }
@@ -246,6 +254,16 @@ impl TreeSettingsBuilder {
         self
     }
 
+    pub fn wal(mut self, is_enabled: bool) -> Self {
+        self.enable_wal = Some(is_enabled);
+        self
+    }
+
+    pub fn wal_max_size(mut self, size: u64) -> Self {
+        self.wal_max_size = Some(size);
+        self
+    }
+
     /// Sets the compression configuration for the tree.
     ///
     /// This method configures how data is compressed before being written to disk.
@@ -291,6 +309,8 @@ impl TreeSettingsBuilder {
             enable_bloom_filter_cache: self.enable_bloom_filter_cache.unwrap_or(true),
             enable_index_cache: self.enable_index_cache.unwrap_or(true),
             enable_value_cache: self.enable_value_cache.unwrap_or(true),
+            enable_wal: self.enable_wal.unwrap_or(true),
+            wal_max_size: self.wal_max_size.unwrap_or(DEFAULT_WAL_MAX_SIZE),
             compressor: self.compressor.unwrap_or(Compressor::new(CompressionConfig::balanced())),
         }
     }

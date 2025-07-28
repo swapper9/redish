@@ -19,6 +19,8 @@
 //! tree.put_typed::<User>("key3", &user);
 //! ```
 
+extern crate core;
+
 pub mod tree;
 pub mod util;
 pub mod config;

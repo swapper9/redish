@@ -1,4 +1,5 @@
 use crate::config::{CURRENT_VERSION, FOOTER_MAGIC_NUMBER, FOOTER_SIZE, HEADER_MAGIC_NUMBER};
+use crate::tree::tree_error::TreeResult;
 use crate::tree::BloomFilter;
 use crate::{util, DataValue, Tree};
 use crc32fast::Hasher;
@@ -79,7 +80,7 @@ impl Tree {
                 Some(data_value)
             }
             Err(e) => {
-                log::error!(
+                error!(
                     "Error reading data entry from SSTable {:?} with offset {:?}: {}",
                     path,
                     data_offset,
@@ -111,7 +112,7 @@ impl Tree {
                 contains_key
             }
             Err(e) => {
-                log::error!("Error loading SSTable {:?} for bloom filter check: {}", path, e);
+                error!("Error loading SSTable {:?} for bloom filter check: {}", path, e);
                 false
             }
         }
@@ -213,7 +214,7 @@ impl Tree {
                 table
             },
             Err(e) => {
-                log::error!("Error loading SSTable {:?}: {}", path, e);
+                error!("Error loading SSTable {:?}: {}", path, e);
                 BTreeMap::new()
             }
         }
@@ -467,10 +468,10 @@ impl Tree {
         Ok(())
     }
 
-    pub(crate) fn merge_sstables(&mut self) {
+    pub(crate) fn merge_sstables(&mut self) -> TreeResult<()> {
         let tables_to_merge_count = std::cmp::min(self.ss_tables.len(), 3);
         if tables_to_merge_count < 2 {
-            return;
+            return Ok(());
         }
 
         let tables_to_merge: Vec<PathBuf> =
@@ -482,7 +483,10 @@ impl Tree {
             table_data.push(self.load_sstable(table_path));
         }
 
-        let mut iterators: Vec<_> = table_data.iter().map(|table| table.iter()).collect();
+        let mut iterators: Vec<_> = table_data
+            .iter()
+            .map(|table| table.iter())
+            .collect();
 
         let mut min_heap = BinaryHeap::new();
 
@@ -555,23 +559,25 @@ impl Tree {
                 }
             }
             Err(e) => {
-                log::error!("Error writing merged SSTable: {}", e);
-                return;
+                error!("Error writing merged SSTable: {}", e);
+                return Ok(());
             }
         };
 
         for path in tables_to_merge {
             if let Err(e) = std::fs::remove_file(&path) {
-                log::error!("Error deleting old SSTable {:?}: {}", path, e);
+                error!("Error deleting old SSTable {:?}: {}", path, e);
             }
             self.ss_tables.retain(|p| p != &path);
             self.bloom_filters.retain(|bf| bf.path != path);
         }
 
         if let Err(e) = self.rename_sstables_after_merge() {
-            log::error!("Error renaming SSTable files: {}", e);
-            return;
+            error!("Error renaming SSTable files: {}", e);
+            return Ok(());
         }
+        
+        Ok(())
     }
 
     fn rename_sstables_after_merge(&mut self) -> std::io::Result<()> {
@@ -714,17 +720,17 @@ impl Tree {
             Ok(file) => {
                 let mut reader = BufReader::new(file);
                 if self.validate_header(&mut reader).is_err() {
-                    log::error!("Error validating header SSTable : {:?}", path);
+                    error!("Error validating header SSTable : {:?}", path);
                     return false;
                 }
                 if self.read_footer(&mut reader).is_err() {
-                    log::error!("Error validating footer SSTable {:?}", path);
+                    error!("Error validating footer SSTable {:?}", path);
                     return false;
                 }
                 true
             }
             Err(e) => {
-                log::error!("Error opening SSTable {:?}: {}", path, e);
+                error!("Error opening SSTable {:?}: {}", path, e);
                 false
             }
         }

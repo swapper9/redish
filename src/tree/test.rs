@@ -2,6 +2,7 @@
 mod test {
     use crate::config::{DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE};
     use crate::tree::compression::CompressionConfig;
+    use crate::tree::tree_error::TreeResult;
     use crate::tree::{Tree, TreeSettings, TreeSettingsBuilder};
     use bincode::{Decode, Encode};
     use rand::prelude::*;
@@ -9,6 +10,7 @@ mod test {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Instant;
+    use std::mem;
 
     #[derive(Debug, Encode, Decode, PartialEq)]
     pub struct TestStruct {
@@ -33,7 +35,7 @@ mod test {
 
     #[test]
     #[serial]
-    fn test_create_trees() {
+    fn test_create_trees() -> TreeResult<()> {
         clean_temp_dir();
 
         let tree1 = Tree::load_with_settings(
@@ -43,25 +45,25 @@ mod test {
                 .value_cache(false)
                 .compressor(CompressionConfig::default())
                 .build(),
-        );
-        let tree2 = Tree::load_with_settings(TreeSettings::default());
+        )?;
+        let tree2 = Tree::load_with_settings(TreeSettings::default())?;
         let tree3 = Tree::load_with_settings(
             TreeSettingsBuilder::new()
                 .db_path(PathBuf::from(DEFAULT_DB_PATH).join("custom_db"))
                 .build(),
-        );
+        )?;
         let tree4 = Tree::load_with_settings(
             TreeSettingsBuilder::new()
                 .db_path(PathBuf::from(DEFAULT_DB_PATH).join("my_db"))
                 .mem_table_max_size(50000)
                 .build(),
-        );
+        )?;
         let tree5 = Tree::load_with_settings(
             TreeSettingsBuilder::new()
                 .db_path(PathBuf::from(DEFAULT_DB_PATH).join("my_db"))
                 .mem_table_max_size(20000)
                 .build(),
-        );
+        )?;
         assert_eq!(tree1.len(), 0);
         assert_eq!(tree2.len(), 0);
         assert_eq!(tree3.len(), 0);
@@ -69,38 +71,40 @@ mod test {
         assert_eq!(tree5.len(), 0);
 
         clean_temp_dir();
+        Ok(())
     }
 
     #[test]
     #[serial]
-    fn test_put_entries_with_merge_ss_tables() {
+    fn test_put_entries_with_merge_ss_tables() -> TreeResult<()> {
         clean_temp_dir();
 
-        let mut tree = Tree::load_with_path(DEFAULT_DB_PATH);
+        let mut tree = Tree::load_with_path(DEFAULT_DB_PATH)?;
         let max_entries: u64 = 100000;
         for i in 1..=max_entries {
             let user = User {
                 user_id: i,
                 username: format!("test_user_{}", i),
             };
-            tree.put_typed::<User>(&format!("test_user_{}", i), &user);
+            tree.put_typed::<User>(&format!("test_user_{}", i), &user)?;
         }
-        tree.flush();
+        tree.flush()?;
         assert!((tree.ss_tables.len() as u64) < (max_entries / DEFAULT_MEM_TABLE_SIZE as u64 / 3));
         assert_eq!(tree.len(), max_entries as usize);
 
         clean_temp_dir();
+        Ok(())
     }
 
     #[test]
     #[serial]
-    fn test_write_and_load_entries_with_flush_and_random_search() {
+    fn test_write_and_load_entries_with_flush_and_random_search() -> TreeResult<()> {
         clean_temp_dir();
 
         let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
             .compressor(CompressionConfig::none())
             .build()
-        );
+        )?;
 
         const ENTRIES: usize = 100000;
         const RANDOM_SEARCHES: usize = 5000;
@@ -118,13 +122,13 @@ mod test {
         for i in 0..ENTRIES {
             let key = format!("key_{:08}_{}", i, generate_random_string(KEY_LENGTH - 12));
             let value = generate_realistic_value("user_data", VALUE_LENGTH);
-            tree.put_typed(&key, &value);
+            tree.put_typed(&key, &value)?;
             keys.push(key);
         }
         let write_duration = write_start.elapsed();
 
         let flush_start = Instant::now();
-        tree.flush();
+        tree.flush()?;
         let flush_duration = flush_start.elapsed();
 
         println!("tree.mem_table.len: {}", tree.mem_table.len());
@@ -142,7 +146,7 @@ mod test {
         let mut random_found = 0;
 
         for key in random_keys {
-            if let Some(_value) = tree.get_typed::<String>(key) {
+            if let Some(_value) = tree.get_typed::<String>(key)? {
                 random_found += 1;
             }
         }
@@ -171,11 +175,32 @@ mod test {
         println!("{}", tree.get_value_cache_stats());
 
         clean_temp_dir();
+        Ok(())
     }
 
+    #[serial]
+    #[test]
+    fn test_crash_recovery_with_wal() -> TreeResult<()> {
+        clean_temp_dir();
+
+        {
+            let mut tree = Tree::load()?;
+            tree.put(b"key1".to_vec(), b"value1".to_vec())?;
+            tree.put(b"key2".to_vec(), b"value2".to_vec())?;
+            mem::forget(tree);
+        }
+
+        let mut recovered_tree = Tree::load()?;
+        let value1 = recovered_tree.get(b"key1")?;
+        let value2 = recovered_tree.get(b"key2")?;
+        assert_eq!(value1, Some(b"value1".to_vec()));
+        assert_eq!(value2, Some(b"value2".to_vec()));
+        Ok(())
+    }
+    
     #[test]
     #[serial]
-    fn test_read_write_100k_entries() {
+    fn test_read_write_100k_entries() -> TreeResult<()> {
         clean_temp_dir();
 
         let mut tree = Tree::load_with_settings(
@@ -183,13 +208,13 @@ mod test {
                 .compressor(CompressionConfig::default())
                 .mem_table_max_size(100000)
                 .build(),
-        );
+        )?;
         let max_entries: u64 = 99999;
 
         let start_time = Instant::now();
         for i in 0..=max_entries {
             let key = format!("test_key_{}", i);
-            tree.put(key.as_bytes().to_vec(), key.as_bytes().to_vec());
+            tree.put(key.as_bytes().to_vec(), key.as_bytes().to_vec())?;
         }
         let write_duration = start_time.elapsed();
         println!(
@@ -200,7 +225,7 @@ mod test {
         let start_time = Instant::now();
         for i in 0..=max_entries {
             let key = format!("test_key_{}", i);
-            tree.get(key.as_bytes()).unwrap();
+            tree.get(key.as_bytes())?;
         }
         let read_duration = start_time.elapsed();
 
@@ -217,11 +242,12 @@ mod test {
         println!("{}", tree.get_index_cache_stats());
         println!("{}", tree.get_value_cache_stats());
         clean_temp_dir();
+        Ok(())
     }
 
     #[test]
     #[serial]
-    fn test_compression_performance() {
+    fn test_compression_performance() -> TreeResult<()> {
         clean_temp_dir();
 
         let test_data = generate_compressible_data(10000);
@@ -246,19 +272,19 @@ mod test {
                     .value_cache(false)
                     .compressor(config)
                     .build(),
-            );
+            )?;
 
             let start_time = Instant::now();
 
             for i in 0..100 {
-                tree.put_typed(&format!("perf_test_{}", i), &test_data);
+                tree.put_typed(&format!("perf_test_{}", i), &test_data)?;
             }
 
             let write_time = start_time.elapsed();
             let read_start = Instant::now();
 
             for i in 0..100 {
-                let retrieved: Option<String> = tree.get_typed(&format!("perf_test_{}", i));
+                let retrieved: Option<String> = tree.get_typed(&format!("perf_test_{}", i))?;
                 assert!(
                     retrieved.is_some(),
                     "Failed to retrieve data for key: perf_test_{}",
@@ -279,11 +305,12 @@ mod test {
         }
 
         clean_temp_dir();
+        Ok(())
     }
 
     #[test]
     #[serial]
-    fn test_compression_with_large_objects() {
+    fn test_compression_with_large_objects() -> TreeResult<()> {
         clean_temp_dir();
 
         #[derive(Debug, Encode, Decode, Clone, PartialEq)]
@@ -310,27 +337,28 @@ mod test {
                                                     .value_cache(false)
                                                     .compressor(CompressionConfig::balanced())
             .build()
-        );
+        )?;
 
-        tree.put_typed("large_object", &large_object);
+        tree.put_typed("large_object", &large_object)?;
 
-        let retrieved: Option<LargeObject> = tree.get_typed("large_object");
+        let retrieved: Option<LargeObject> = tree.get_typed("large_object")?;
         assert!(retrieved.is_some(), "Failed to retrieve large object");
 
         let retrieved_object = retrieved.unwrap();
         assert_eq!(retrieved_object, large_object, "Large object data mismatch");
 
         clean_temp_dir();
+        Ok(())
     }
 
     #[test]
     #[serial]
-    fn test_basic_string_loadtest() {
+    fn test_basic_string_loadtest() -> TreeResult<()> {
         clean_temp_dir();
 
         let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
             .compressor(CompressionConfig::balanced())
-            .build());
+            .build())?;
 
         const ENTRIES: usize = 50000;
         const KEY_LENGTH: usize = 16;
@@ -342,7 +370,6 @@ mod test {
             ENTRIES, KEY_LENGTH, VALUE_LENGTH
         );
 
-        // Write phase
         let write_start = Instant::now();
         let mut keys = Vec::with_capacity(ENTRIES);
 
@@ -350,7 +377,7 @@ mod test {
             let key = format!("key_{:08}_{}", i, generate_random_string(KEY_LENGTH - 12));
             let value = generate_realistic_value("user_data", VALUE_LENGTH);
 
-            tree.put_typed(&key, &value);
+            tree.put_typed(&key, &value)?;
             keys.push(key);
 
             if i % 10000 == 0 {
@@ -365,18 +392,16 @@ mod test {
             ENTRIES as f64 / write_duration.as_secs_f64()
         );
 
-        // Flush to disk
         let flush_start = Instant::now();
-        tree.flush();
+        tree.flush()?;
         let flush_duration = flush_start.elapsed();
         println!("Flush completed in {:?}", flush_duration);
 
-        // Read phase - sequential
         let read_start = Instant::now();
         let mut found_count = 0;
 
         for key in &keys {
-            if let Some(_value) = tree.get_typed::<String>(key) {
+            if let Some(_value) = tree.get_typed::<String>(key)? {
                 found_count += 1;
             }
         }
@@ -389,7 +414,6 @@ mod test {
         );
         println!("Found: {}/{} entries", found_count, ENTRIES);
 
-        // Random read phase
         let mut rng = rand::rng();
         let random_keys: Vec<_> = keys.choose_multiple(&mut rng, 5000).collect();
 
@@ -397,7 +421,7 @@ mod test {
         let mut random_found = 0;
 
         for key in random_keys {
-            if let Some(_value) = tree.get_typed::<String>(key) {
+            if let Some(_value) = tree.get_typed::<String>(key)? {
                 random_found += 1;
             }
         }
@@ -410,17 +434,17 @@ mod test {
         );
         println!("Random found: {}/5000 entries", random_found);
 
-        // Cache statistics
         println!("\n=== Cache Statistics ===");
         println!("Index cache: {}", tree.get_index_cache_stats());
         println!("Value cache: {}", tree.get_value_cache_stats());
 
         clean_temp_dir();
+        Ok(())
     }
 
     #[test]
     #[serial]
-    fn test_variable_size_loadtest() {
+    fn test_variable_size_loadtest() -> TreeResult<()> {
         clean_temp_dir();
 
         let mut tree = Tree::load_with_settings(
@@ -429,7 +453,7 @@ mod test {
                 .bloom_filter_cache(true)
                 .compressor(CompressionConfig::fast())
                 .build()
-        );
+        )?;
 
         println!("=== Variable Size Load Test ===");
 
@@ -450,7 +474,7 @@ mod test {
                 let value_size = rand::rng().random_range(min_size..=max_size);
                 let value = generate_realistic_value("log_entry", value_size);
 
-                tree.put_typed(&key, &value);
+                tree.put_typed(&key, &value)?;
                 keys.push(key);
             }
 
@@ -461,13 +485,13 @@ mod test {
                 write_duration,
                 count as f64 / write_duration.as_secs_f64()
             );
-            tree.flush();
+            tree.flush()?;
             // Read back
             let read_start = Instant::now();
             let mut found = 0;
 
             for key in &keys {
-                if let Some(_value) = tree.get_typed::<String>(key) {
+                if let Some(_value) = tree.get_typed::<String>(key)? {
                     found += 1;
                 }
             }
@@ -488,6 +512,7 @@ mod test {
         println!("Value cache: {}", tree.get_value_cache_stats());
 
         clean_temp_dir();
+        Ok(())
     }
 
     fn generate_random_string(length: usize) -> String {

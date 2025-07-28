@@ -30,6 +30,32 @@ impl DataValue {
         }
     }
 
+    /// Creates a checkpoint marker DataValue.
+    ///
+    /// A checkpoint marker is a special type of DataValue used in Write-Ahead Logging (WAL)
+    /// to indicate a point in the log where all preceding operations have been safely
+    /// persisted to durable storage (SSTable files). This marker is crucial for WAL
+    /// recovery and cleanup operations.
+    ///
+    /// # Returns
+    ///
+    /// A new `DataValue` instance configured as a checkpoint marker
+    ///
+    /// # See Also
+    ///
+    /// - [`DataValue::tombstone()`] for deletion markers
+    /// - [`Tree::write_to_wal()`] for WAL write operations
+    /// - [`Tree::recover_from_wal()`] for recovery process
+    /// - [`Tree::cleanup_wal_before_checkpoint()`] for WAL maintenance
+    pub fn checkpoint() -> Self {
+        Self {
+            data: Vec::new(),
+            expires_at: None,
+            created_at: SystemTime::now(),
+            is_tombstone: false,
+        }
+    }
+
     /// Checks if the stored data is empty.
     ///
     /// # Returns

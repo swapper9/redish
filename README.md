@@ -8,15 +8,17 @@ A lightweight in-memory key-value storage DB created based on LSM Tree.
 - Type-friendly
 - TTL support for keys
 - Persistence with sstable auto-merge
+- Write-ahead log (WAL)
 - Bloom filter with optional caching
 - Optional index caching
 - Optional value caching
 - Optional compression (lz4, zstd or snappy)
 
 Default settings are:
+- WAL on
 - bloom filter on
 - index caching on (100Mb cache)
-- value caching on (200Mb cache, 200k values max)
+- value caching on (200Mb cache, 200k values)
 - compression on (LZ4 level 1, "balanced")
 All these settings could be altered via TreeSettingsBuilder.
 
@@ -35,17 +37,17 @@ struct User {
 let user = User {user_id: 3, username: "JohnDoe2020".to_string()};
 
 // to use default path for db 
-let mut tree = Tree::load();
+let mut tree = Tree::load()?;
 
 // or specified path
-let mut tree2 = Tree::load_with_path("/path/to/db/with_file_name");
+let mut tree2 = Tree::load_with_path("/path/to/db/with_file_name")?;
 
 
-tree.put("key1".to_string().into_bytes(), "value".to_string().into_bytes());
-tree.put_with_ttl("key2".to_string().into_bytes(), "value".to_string().into_bytes(), Some(Duration::from_secs(60)));
+tree.put("key1".to_string().into_bytes(), "value".to_string().into_bytes())?;
+tree.put_with_ttl("key2".to_string().into_bytes(), "value".to_string().into_bytes(), Some(Duration::from_secs(60)))?;
 
 // type-friendly usage with turbo-fish
-tree.put_typed::<User>("key3", &user);
+tree.put_typed::<User>("key3", &user)?;
 
 assert_eq!(user.username, tree.get_typed::<User>("key3"));
 ```
@@ -59,5 +61,5 @@ let tree = Tree::load_with_settings(
                 .value_cache(true)
                 .compressor(CompressionConfig::best())
                 .build()
-        );
+        )?;
 ```

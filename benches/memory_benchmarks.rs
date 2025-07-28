@@ -7,12 +7,12 @@ fn bench_memory_usage(c: &mut Criterion) {
 
     group.bench_function("memory_growth", |b| {
         b.iter(|| {
-            let mut tree = Tree::new();
+            let mut tree = Tree::new().unwrap();
 
             for i in 0..10000 {
                 let key = format!("key_{}", i);
                 let value = format!("value_{}", i);
-                tree.put_typed(&key, &value);
+                tree.put_typed(&key, &value).unwrap();
 
                 if i % 1000 == 0 {
                     black_box(tree.len());
