@@ -8,9 +8,9 @@ mod test {
     use rand::prelude::*;
     use serial_test::serial;
     use std::collections::HashMap;
+    use std::mem;
     use std::path::PathBuf;
     use std::time::Instant;
-    use std::mem;
 
     #[derive(Debug, Encode, Decode, PartialEq)]
     pub struct TestStruct {
@@ -101,9 +101,10 @@ mod test {
     fn test_write_and_load_entries_with_flush_and_random_search() -> TreeResult<()> {
         clean_temp_dir();
 
-        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
-            .compressor(CompressionConfig::none())
-            .build()
+        let mut tree = Tree::load_with_settings(
+            TreeSettingsBuilder::new()
+                .compressor(CompressionConfig::none())
+                .build(),
         )?;
 
         const ENTRIES: usize = 100000;
@@ -153,8 +154,7 @@ mod test {
         let random_read_duration = random_read_start.elapsed();
 
         assert_eq!(
-            RANDOM_SEARCHES,
-            random_found,
+            RANDOM_SEARCHES, random_found,
             "Not all random entries found through get_typed"
         );
 
@@ -178,26 +178,124 @@ mod test {
         Ok(())
     }
 
-    #[serial]
     #[test]
+    #[serial]
+    fn test_continious_write_entries_with_flush_and_random_search() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(
+            TreeSettingsBuilder::new()
+                .index_cache_memory_limit(500 * 1024 * 1024)
+                .value_cache_memory_limit(100 * 1024 * 1024)
+                .compressor(CompressionConfig::none())
+                .build(),
+        )?;
+
+        const ENTRIES: usize = 30000;
+        const RANDOM_SEARCHES: usize = 1000;
+        const KEY_LENGTH: usize = 16;
+        const VALUE_LENGTH: usize = 100;
+
+        println!(
+            "Entries: {}, Key Length: {}, Value Length: {}",
+            ENTRIES, KEY_LENGTH, VALUE_LENGTH
+        );
+
+        for i in 0..10 {
+            println!("Iteration: {}", i);
+            let mut keys = Vec::with_capacity(ENTRIES);
+
+            let write_start = Instant::now();
+            for i in 0..ENTRIES {
+                let key = format!("key_{:08}_{}", i, generate_random_string(KEY_LENGTH - 12));
+                let value = generate_realistic_value("user_data", VALUE_LENGTH);
+                tree.put_typed(&key, &value)?;
+                keys.push(key);
+            }
+            let write_duration = write_start.elapsed();
+
+            let flush_start = Instant::now();
+            tree.flush()?;
+            let flush_duration = flush_start.elapsed();
+
+            let mut rng = rand::rng();
+            let random_keys: Vec<_> = keys.choose_multiple(&mut rng, RANDOM_SEARCHES).collect();
+            let random_keys_len = random_keys.len();
+
+            let random_read_start = Instant::now();
+            let mut random_found = 0;
+
+            for key in random_keys {
+                if let Some(_value) = tree.get_typed::<String>(key)? {
+                    random_found += 1;
+                }
+            }
+            let random_read_duration = random_read_start.elapsed();
+
+            assert_eq!(
+                RANDOM_SEARCHES, random_found,
+                "Not all random entries found through get_typed"
+            );
+
+            println!("===> Performance statistics:");
+            println!(
+                "Write speed: {:.2} entries/ms",
+                ENTRIES as f64 / write_duration.as_millis() as f64
+            );
+            println!(
+                "Flush speed: {:.2} entries/ms",
+                ENTRIES as f64 / flush_duration.as_millis() as f64
+            );
+            println!(
+                "Search speed through get_typed (random): {:.2} searches/ms",
+                random_keys_len as f64 / random_read_duration.as_millis() as f64
+            );
+        }
+
+        println!("{}", tree.get_index_cache_stats());
+        println!("{}", tree.get_value_cache_stats());
+
+        clean_temp_dir();
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn test_crash_recovery_with_wal() -> TreeResult<()> {
         clean_temp_dir();
 
         {
-            let mut tree = Tree::load()?;
+            const ENTRIES: usize = 4555;
+            const KEY_LENGTH: usize = 16;
+            const VALUE_LENGTH: usize = 100;
+
+            let mut tree = Tree::load_with_settings(
+                TreeSettingsBuilder::new().mem_table_max_size(2000).build(),
+            )?;
+
+            let mut keys = Vec::with_capacity(ENTRIES);
+            for i in 0..ENTRIES {
+                let key = format!("key_{:08}_{}", i, generate_random_string(KEY_LENGTH - 12));
+                let value = generate_realistic_value("user_data", VALUE_LENGTH);
+                tree.put_typed(&key, &value)?;
+                keys.push(key);
+            }
             tree.put(b"key1".to_vec(), b"value1".to_vec())?;
             tree.put(b"key2".to_vec(), b"value2".to_vec())?;
             mem::forget(tree);
         }
 
-        let mut recovered_tree = Tree::load()?;
-        let value1 = recovered_tree.get(b"key1")?;
-        let value2 = recovered_tree.get(b"key2")?;
-        assert_eq!(value1, Some(b"value1".to_vec()));
-        assert_eq!(value2, Some(b"value2".to_vec()));
+        {
+            let mut recovered_tree = Tree::load()?;
+            let value1 = recovered_tree.get(b"key1")?;
+            let value2 = recovered_tree.get(b"key2")?;
+            assert_eq!(value1, Some(b"value1".to_vec()));
+            assert_eq!(value2, Some(b"value2".to_vec()));
+        }
+
         Ok(())
     }
-    
+
     #[test]
     #[serial]
     fn test_read_write_100k_entries() -> TreeResult<()> {
@@ -332,11 +430,12 @@ mod test {
             },
         };
 
-        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
-                                                    .index_cache(false)
-                                                    .value_cache(false)
-                                                    .compressor(CompressionConfig::balanced())
-            .build()
+        let mut tree = Tree::load_with_settings(
+            TreeSettingsBuilder::new()
+                .index_cache(false)
+                .value_cache(false)
+                .compressor(CompressionConfig::balanced())
+                .build(),
         )?;
 
         tree.put_typed("large_object", &large_object)?;
@@ -356,9 +455,11 @@ mod test {
     fn test_basic_string_loadtest() -> TreeResult<()> {
         clean_temp_dir();
 
-        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
-            .compressor(CompressionConfig::balanced())
-            .build())?;
+        let mut tree = Tree::load_with_settings(
+            TreeSettingsBuilder::new()
+                .compressor(CompressionConfig::balanced())
+                .build(),
+        )?;
 
         const ENTRIES: usize = 50000;
         const KEY_LENGTH: usize = 16;
@@ -452,7 +553,7 @@ mod test {
                 .mem_table_max_size(5000)
                 .bloom_filter_cache(true)
                 .compressor(CompressionConfig::fast())
-                .build()
+                .build(),
         )?;
 
         println!("=== Variable Size Load Test ===");

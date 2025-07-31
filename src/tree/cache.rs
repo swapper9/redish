@@ -42,31 +42,6 @@ use std::path::PathBuf;
 /// - **Put operations**: O(1) average case, O(n) worst case during eviction
 /// - **Memory overhead**: Approximately 40-60 bytes per entry
 ///
-/// # Examples
-///
-/// ```rust
-/// // Create with default settings
-/// let mut cache = LRUValueCache::default();
-///
-/// // Create with custom settings
-/// let mut cache = LRUValueCacheBuilder::new()
-///     .max_capacity(2000)
-///     .memory_limit(64 * 1024 * 1024) // 64MB
-///     .build();
-///
-/// // Store and retrieve values
-/// let key = (PathBuf::from("table1"), b"key1".to_vec());
-/// let value = DataValue::new(b"value1".to_vec(), None);
-/// cache.put(key.clone(), value);
-///
-/// if let Some(cached_value) = cache.get(&key) {
-///     println!("Cache hit!");
-/// }
-///
-/// // Check statistics
-/// let stats = cache.stats();
-/// println!("Hit rate: {:.2}%", stats.hit_rate_percentage());
-/// ```
 /// # See Also
 ///
 /// - [`LRUValueCacheBuilder`] - For building configured instances
@@ -187,7 +162,7 @@ impl LRUValueCache {
             self.remove(&key.sstable_path, &key.key);
         }
     }
-    
+
     pub(crate) fn rename_sstable(&mut self, old_path: &PathBuf, new_path: &PathBuf) {
         let keys_to_rename: Vec<CacheKey> = self
             .cache
@@ -258,105 +233,6 @@ impl LRUValueCache {
     }
 }
 
-/// Builder for configuring `LRUValueCache` instances.
-///
-/// This builder provides a fluent interface for setting up value cache parameters
-/// including capacity limits, memory constraints, and performance tuning options.
-pub struct LRUValueCacheBuilder {
-    max_capacity: Option<usize>,
-    memory_limit: Option<usize>,
-}
-
-impl LRUValueCacheBuilder {
-    /// Creates a new builder with default values.
-    ///
-    /// All configuration options are initially unset and will use their
-    /// default values when `build()` is called.
-    ///
-    /// # Returns
-    /// A new `LRUValueCacheBuilder` instance
-    pub fn new() -> Self {
-        Self {
-            max_capacity: None,
-            memory_limit: None,
-        }
-    }
-
-    /// Sets the maximum number of entries the cache can hold.
-    ///
-    /// When the cache reaches this limit, the least recently used entries
-    /// will be evicted to make room for new ones. This acts as a hard limit
-    /// on the number of cached values regardless of memory usage.
-    ///
-    /// # Arguments
-    /// * `capacity` - Maximum number of cache entries
-    ///
-    /// # Returns
-    /// Self for method chaining
-    ///
-    /// # Default
-    /// Uses `DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY` if not specified
-    pub fn max_capacity(mut self, capacity: usize) -> Self {
-        self.max_capacity = Some(capacity);
-        self
-    }
-
-    /// Sets the maximum memory the cache can use in bytes.
-    ///
-    /// The cache will evict entries when the estimated memory usage exceeds
-    /// this limit, even if the entry count is below `max_capacity`. This
-    /// provides memory-aware caching behavior.
-    ///
-    /// # Arguments
-    /// * `limit` - Maximum memory usage in bytes
-    ///
-    /// # Returns
-    /// Self for method chaining
-    ///
-    /// # Memory Estimation
-    /// Memory usage is estimated based on:
-    /// - Key size (path + key bytes)
-    /// - Value size (data + metadata)
-    /// - Internal data structure overhead
-    ///
-    /// # Default
-    /// Uses `DEFAULT_VALUE_CACHE_MEMORY_LIMIT` if not specified
-    pub fn memory_limit(mut self, limit: usize) -> Self {
-        self.memory_limit = Some(limit);
-        self
-    }
-
-    /// Builds the `LRUValueCache` with the configured settings.
-    ///
-    /// Any unspecified settings will use their default values from the
-    /// configuration constants.
-    ///
-    /// # Returns
-    /// A new `LRUValueCache` instance
-    ///
-    /// # Examples
-    /// ```rust
-    /// let cache = LRUValueCacheBuilder::new()
-    ///     .max_capacity(1000)
-    ///     .memory_limit(32 * 1024 * 1024)
-    ///     .build();
-    /// ```
-    pub fn build(self) -> LRUValueCache {
-        LRUValueCache::new(
-            self.max_capacity
-                .unwrap_or(DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY),
-            self.memory_limit
-                .unwrap_or(DEFAULT_VALUE_CACHE_MEMORY_LIMIT),
-        )
-    }
-}
-
-impl Default for LRUValueCacheBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// An LRU (Least Recently Used) cache for storing SSTable indexes.
 ///
 /// This cache stores the complete index structure of SSTable files in memory
@@ -399,41 +275,6 @@ impl Default for LRUValueCacheBuilder {
 /// - **Put operations**: O(1) average case, O(m) worst case during eviction
 /// - **Memory overhead**: Approximately 32-48 bytes per cached key
 ///
-/// # Examples
-///
-/// ```rust
-/// use redish::tree::{LRUIndexCache, LRUIndexCacheBuilder};
-/// use std::path::PathBuf;
-/// use std::collections::BTreeMap;
-///
-/// // Create with default settings
-/// let mut cache = LRUIndexCache::default();
-///
-/// // Create with custom settings
-/// let mut cache = LRUIndexCacheBuilder::new()
-///     .max_capacity(300)
-///     .memory_limit(32 * 1024 * 1024) // 32MB
-///     .build();
-///
-/// // Cache an SSTable index
-/// let table_path = PathBuf::from("sstable_001.sst");
-/// let mut index = BTreeMap::new();
-/// index.insert(b"key1".to_vec(), 0u64);
-/// index.insert(b"key2".to_vec(), 1024u64);
-///
-/// cache.put(table_path.clone(), index);
-///
-/// // Retrieve cached index
-/// if let Some(cached_index) = cache.get(&table_path) {
-///     if let Some(offset) = cached_index.get(b"key1") {
-///         println!("Found key1 at offset {}", offset);
-///     }
-/// }
-///
-/// // Check statistics
-/// let stats = cache.stats();
-/// println!("Cache efficiency: {:.2}%", stats.hit_rate_percentage());
-/// ```
 /// # See Also
 ///
 /// - [`LRUIndexCacheBuilder`] - For building configured instances
@@ -502,7 +343,7 @@ impl LRUIndexCache {
             return;
         }
 
-        while (self.cache.len() >= self.max_capacity)
+         while (self.cache.len() >= self.max_capacity)
             || (self.current_memory_usage + index_size > self.memory_limit)
         {
             if !self.evict_lru() {
@@ -637,139 +478,6 @@ impl LRUIndexCache {
 
     pub fn contains_key(&mut self, key: &PathBuf) -> bool {
         self.get(key).is_some()
-    }
-}
-
-/// Builder for configuring `LRUIndexCache` instances.
-///
-/// This builder provides a fluent interface for setting up index cache parameters
-/// including capacity limits, memory constraints, and performance tuning options.
-pub struct LRUIndexCacheBuilder {
-    max_capacity: Option<usize>,
-    memory_limit: Option<usize>,
-}
-
-impl LRUIndexCacheBuilder {
-    /// Creates a new builder with default values.
-    ///
-    /// All configuration options are initially unset and will use their
-    /// default values when `build()` is called.
-    ///
-    /// # Returns
-    /// A new `LRUIndexCacheBuilder` instance
-    ///
-    /// # Examples
-    /// ```rust
-    /// let builder = LRUIndexCacheBuilder::new();
-    /// let cache = builder.build(); // Uses all defaults
-    /// ```
-    pub fn new() -> Self {
-        Self {
-            max_capacity: None,
-            memory_limit: None,
-        }
-    }
-
-    /// Sets the maximum number of SSTable indexes the cache can hold.
-    ///
-    /// Each entry in the index cache corresponds to one SSTable file's
-    /// complete index. When the cache reaches this limit, the least recently
-    /// used indexes will be evicted to make room for new ones.
-    ///
-    /// # Arguments
-    /// * `capacity` - Maximum number of cached SSTable indexes
-    ///
-    /// # Returns
-    /// Self for method chaining
-    ///
-    /// # Examples
-    /// ```rust
-    /// let cache = LRUIndexCacheBuilder::new()
-    ///     .max_capacity(300)
-    ///     .build();
-    /// ```
-    ///
-    /// # Performance Impact
-    /// - **Higher values**: Fewer disk reads for index lookups
-    /// - **Lower values**: More frequent index reloading from disk
-    ///
-    /// # Sizing Guidelines
-    /// - Set to roughly match your expected number of active SSTable files
-    /// - Consider read patterns and working set size
-    /// - Balance with available memory constraints
-    ///
-    /// # Default
-    /// Uses `DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY` if not specified
-    pub fn max_capacity(mut self, capacity: usize) -> Self {
-        self.max_capacity = Some(capacity);
-        self
-    }
-
-    /// Sets the maximum memory the cache can use in bytes.
-    ///
-    /// The cache will evict indexes when the estimated memory usage exceeds
-    /// this limit. Index memory usage depends on the number of keys in each
-    /// SSTable and the size of those keys.
-    ///
-    /// # Arguments
-    /// * `limit` - Maximum memory usage in bytes
-    ///
-    /// # Returns
-    /// Self for method chaining
-    ///
-    /// # Examples
-    /// ```rust
-    /// let cache = LRUIndexCacheBuilder::new()
-    ///     .memory_limit(32 * 1024 * 1024) // 32MB limit
-    ///     .build();
-    /// ```
-    ///
-    /// # Memory Estimation
-    /// Memory usage includes:
-    /// - Key data (actual key bytes)
-    /// - File offset information (8 bytes per key)
-    /// - BTreeMap overhead for index structure
-    /// - Path information for each cached SSTable
-    ///
-    /// # Performance Impact
-    /// - **Higher limits**: Better index cache hit rates
-    /// - **Lower limits**: More frequent index reloading
-    ///
-    /// # Default
-    /// Uses `DEFAULT_INDEX_CACHE_MEMORY_LIMIT` if not specified
-    pub fn memory_limit(mut self, limit: usize) -> Self {
-        self.memory_limit = Some(limit);
-        self
-    }
-
-    /// Builds the `LRUIndexCache` with the configured settings.
-    ///
-    /// Any unspecified settings will use their default values from the
-    /// configuration constants.
-    ///
-    /// # Returns
-    /// A new `LRUIndexCache` instance
-    ///
-    /// # Examples
-    /// ```rust
-    /// let cache = LRUIndexCacheBuilder::new()
-    ///     .max_capacity(150)
-    ///     .memory_limit(16 * 1024 * 1024)
-    ///     .build();
-    /// ```
-    pub fn build(self) -> LRUIndexCache {
-        LRUIndexCache::new(
-            self.max_capacity
-                .unwrap_or(DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY),
-            self.memory_limit
-                .unwrap_or(DEFAULT_INDEX_CACHE_MEMORY_LIMIT),
-        )
-    }
-}
-
-impl Default for LRUIndexCacheBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -270,7 +270,6 @@ impl Tree {
                 };
 
                 Ok((table, bloom_filter))
-
             }
             Err(e) => {
                 Err(std::io::Error::new(
@@ -576,7 +575,9 @@ impl Tree {
             error!("Error renaming SSTable files: {}", e);
             return Ok(());
         }
-        
+
+        self.remove_obsolete_wal_segments();
+
         Ok(())
     }
 
@@ -592,6 +593,10 @@ impl Tree {
                     }
                 }
             }
+        }
+
+        if sstables_with_numbers.is_empty() {
+            return Ok(());
         }
 
         if sstables_with_numbers[0].0 > self.ss_tables.len() {

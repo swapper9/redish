@@ -1,11 +1,13 @@
 pub mod cache;
+mod compression;
 pub mod data_value;
 pub mod settings;
 mod sstable;
 mod test;
-mod compression;
-mod wal;
 mod tree_error;
+mod wal;
+mod wal_reader;
+mod wal_writer;
 
 pub use cache::*;
 pub use compression::*;
@@ -14,7 +16,8 @@ pub use settings::*;
 
 use crate::config::DEFAULT_DB_PATH;
 use crate::tree::tree_error::{TreeError, TreeResult};
-use crate::tree::wal::{WalOperation, WalWriter};
+use crate::tree::wal::WalOperation;
+use crate::tree::wal_writer::WalWriter;
 use crate::{logger, util};
 use bincode::Encode;
 use growable_bloom_filter::GrowableBloom;
@@ -22,6 +25,8 @@ use log::{error, warn};
 use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 static INIT: Lazy<()> = Lazy::new(|| {
@@ -30,7 +35,7 @@ static INIT: Lazy<()> = Lazy::new(|| {
 
 pub struct BloomFilter {
     path: PathBuf,
-    bloom_filter: GrowableBloom
+    bloom_filter: GrowableBloom,
 }
 
 pub struct Tree {
@@ -42,6 +47,8 @@ pub struct Tree {
     index_cache: LRUIndexCache,
     value_cache: LRUValueCache,
     wal_writer: Option<WalWriter>,
+    wal_segments: Vec<u16>,
+    cleanup_sender: Option<mpsc::Sender<u16>>,
 }
 
 impl Drop for Tree {
@@ -67,6 +74,12 @@ impl Tree {
         Lazy::force(&INIT);
         util::logo();
 
+        let (cleanup_sender, cleanup_receiver) = mpsc::channel::<u16>();
+        let db_path = PathBuf::from(DEFAULT_DB_PATH);
+        thread::spawn(move || {
+            Self::wal_background_cleanup_worker(cleanup_receiver, db_path);
+        });
+
         let mut tree = Self {
             mem_table: BTreeMap::new(),
             immutable_mem_tables: VecDeque::new(),
@@ -76,6 +89,8 @@ impl Tree {
             index_cache: LRUIndexCache::default(),
             value_cache: LRUValueCache::default(),
             wal_writer: None,
+            wal_segments: Vec::new(),
+            cleanup_sender: Some(cleanup_sender),
         };
 
         if tree.settings.enable_wal {
@@ -103,6 +118,17 @@ impl Tree {
             db_path: PathBuf::from(path),
             ..TreeSettings::default()
         };
+
+        if let Some(sender) = tree.cleanup_sender.take() {
+            drop(sender);
+        }
+        let (cleanup_sender, cleanup_receiver) = mpsc::channel::<u16>();
+        let db_path = PathBuf::from(path);
+        thread::spawn(move || {
+            Self::wal_background_cleanup_worker(cleanup_receiver, db_path);
+        });
+        tree.cleanup_sender = Some(cleanup_sender);
+
         Ok(tree)
     }
 
@@ -118,7 +144,26 @@ impl Tree {
     /// Returns `TreeError` if initialization fails
     pub fn new_with_settings(settings: TreeSettings) -> TreeResult<Self> {
         let mut tree = Self::new()?;
+
+        if let Some(sender) = tree.cleanup_sender.take() {
+            drop(sender);
+        }
+        let (cleanup_sender, cleanup_receiver) = mpsc::channel::<u16>();
+        let db_path = settings.db_path.clone();
+        thread::spawn(move || {
+            Self::wal_background_cleanup_worker(cleanup_receiver, db_path);
+        });
         tree.settings = settings;
+        tree.index_cache = LRUIndexCache::new(
+            tree.settings.index_cache_max_capacity,
+            tree.settings.index_cache_memory_limit,
+        );
+        tree.value_cache = LRUValueCache::new(
+            tree.settings.value_cache_max_capacity,
+            tree.settings.value_cache_memory_limit,
+        );
+        tree.cleanup_sender = Some(cleanup_sender);
+
         Ok(tree)
     }
 
@@ -174,7 +219,9 @@ impl Tree {
         if self.settings.compressor.config.compression_type == CompressionType::None {
             Ok(data)
         } else {
-            self.settings.compressor.compress(&data)
+            self.settings
+                .compressor
+                .compress(&data)
                 .map_err(|e| TreeError::compression(format!("Compression failed: {}", e)))
         }
     }
@@ -183,7 +230,9 @@ impl Tree {
         if self.settings.compressor.config.compression_type == CompressionType::None {
             Ok(data.to_vec())
         } else {
-            self.settings.compressor.decompress(data)
+            self.settings
+                .compressor
+                .decompress(data)
                 .map_err(|e| TreeError::compression(format!("Decompression failed: {}", e)))
         }
     }
@@ -233,7 +282,15 @@ impl Tree {
     /// Returns `TreeError` if loading fails
     pub fn load_with_settings(settings: TreeSettings) -> TreeResult<Self> {
         let mut tree = Self::new()?;
-        tree.settings = settings.clone();
+        tree.settings = settings;
+        tree.index_cache = LRUIndexCache::new(
+            tree.settings.index_cache_max_capacity,
+            tree.settings.index_cache_memory_limit,
+        );
+        tree.value_cache = LRUValueCache::new(
+            tree.settings.value_cache_max_capacity,
+            tree.settings.value_cache_memory_limit,
+        );
         tree.load_tree()?;
         Ok(tree)
     }
@@ -245,10 +302,9 @@ impl Tree {
             self.settings.db_path.clone()
         };
         if !db_path.exists() {
-            std::fs::create_dir_all(&db_path)
-                .map_err(|e| TreeError::configuration(
-                    format!("Error creating database directory: {}", e)
-                ))?;
+            std::fs::create_dir_all(&db_path).map_err(|e| {
+                TreeError::configuration(format!("Error creating database directory: {}", e))
+            })?;
         }
 
         self.settings.db_path = db_path.clone();
@@ -260,8 +316,9 @@ impl Tree {
             self.recover_from_wal()?;
         }
 
-        let entries = std::fs::read_dir(&db_path)
-            .map_err(|e| TreeError::IoExtended { message: format!("Error reading database folder: {}", e) })?;
+        let entries = std::fs::read_dir(&db_path).map_err(|e| TreeError::IoExtended {
+            message: format!("Error reading database folder: {}", e),
+        })?;
 
         let mut sstable_files = Vec::new();
 
@@ -336,7 +393,12 @@ impl Tree {
         self.put_typed_with_ttl_optional::<T>(key, value, Some(ttl))
     }
 
-    fn put_typed_with_ttl_optional<T>(&mut self, key: &str, value: &T, ttl: Option<Duration>) -> TreeResult<()>
+    fn put_typed_with_ttl_optional<T>(
+        &mut self,
+        key: &str,
+        value: &T,
+        ttl: Option<Duration>,
+    ) -> TreeResult<()>
     where
         T: Encode,
     {
@@ -359,7 +421,12 @@ impl Tree {
     /// * `key` - The key as a byte vector
     /// * `value` - The value as a byte vector
     /// * `ttl` - Optional time-to-live duration
-    pub fn put_with_ttl(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) -> TreeResult<()> {
+    pub fn put_with_ttl(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> TreeResult<()> {
         self.put_to_tree(key, value, ttl)
     }
 
@@ -372,7 +439,12 @@ impl Tree {
     /// * `key` - The key as a byte vector
     /// * `value` - The value as a byte vector
     /// * `ttl` - Optional time-to-live duration
-    pub fn put_to_tree(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Option<Duration>) -> TreeResult<()> {
+    pub fn put_to_tree(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> TreeResult<()> {
         let data = self.apply_compression(value)?;
         let data_value = DataValue::new(data, ttl);
         self.write_to_wal(WalOperation::Put, &key, Some(&data_value))?;
@@ -400,7 +472,8 @@ impl Tree {
         let key_bytes = key.as_bytes();
         match self.get(key_bytes)? {
             Some(value_bytes) => {
-                let (decoded, _) = bincode::decode_from_slice(&value_bytes, self.settings.bincode_config)?;
+                let (decoded, _) =
+                    bincode::decode_from_slice(&value_bytes, self.settings.bincode_config)?;
                 Ok(Some(decoded))
             }
             None => Ok(None),
@@ -633,13 +706,11 @@ impl Tree {
         let sstable_count: usize = self
             .ss_tables
             .iter()
-            .map(|table_path| {
-                match self.count_sstable_entries(table_path) {
-                    Ok(count) => count,
-                    Err(e) => {
-                        error!("Error counting entries in SSTable {:?}: {}", table_path, e);
-                        0
-                    }
+            .map(|table_path| match self.count_sstable_entries(table_path) {
+                Ok(count) => count,
+                Err(e) => {
+                    error!("Error counting entries in SSTable {:?}: {}", table_path, e);
+                    0
                 }
             })
             .sum();
@@ -653,12 +724,12 @@ impl Tree {
                 .values()
                 .filter(|value| !value.is_expired() && !value.is_tombstone)
                 .count()),
-            Err(e) => {
-                Err(TreeError::internal(format!("Failed to count SSTable entries: {}", e)))
-            }
+            Err(e) => Err(TreeError::internal(format!(
+                "Failed to count SSTable entries: {}",
+                e
+            ))),
         }
     }
-
 
     /// Gets the remaining TTL for a key.
     ///
@@ -732,15 +803,18 @@ impl Tree {
 
         self.ss_tables.push(path.clone());
         if self.settings.enable_bloom_filter_cache {
-            self.bloom_filters.push(BloomFilter {
-                path,
-                bloom_filter,
-            });
+            self.bloom_filters.push(BloomFilter { path, bloom_filter });
         }
 
         if let Some(ref mut wal_writer) = self.wal_writer {
-            wal_writer.write_checkpoint()
+            wal_writer
+                .write_checkpoint()
                 .map_err(|e| TreeError::wal(format!("Failed to write checkpoint: {}", e)))?;
+
+            self.check_wal_segments_need_to_be_shifted()?;
+
+            let next_segment = self.get_next_wal_segment_number();
+            self.create_new_wal_segment(next_segment)?;
         }
 
         if self.ss_tables.len() > 2 {
@@ -759,5 +833,4 @@ impl Tree {
             }
         }
     }
-
 }

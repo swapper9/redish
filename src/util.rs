@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::PathBuf;
 
 pub(crate) fn logo() {
@@ -15,7 +14,9 @@ pub(crate) fn logo() {
 }
 
 pub(crate) fn find_last_sstable_number(directory: &PathBuf) -> Option<usize> {
-    fs::read_dir(directory)
+    use std::fs::read_dir;
+
+    read_dir(directory)
         .ok()?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {

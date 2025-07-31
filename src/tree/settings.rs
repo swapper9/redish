@@ -1,4 +1,8 @@
-use crate::config::{BINCODE_CONFIG, DEFAULT_BLOOM_FILTER_ERROR_PROBABILITY, DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE, DEFAULT_WAL_MAX_SIZE};
+use crate::config::{
+    BINCODE_CONFIG, DEFAULT_BLOOM_FILTER_ERROR_PROBABILITY, DEFAULT_DB_PATH,
+    DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY, DEFAULT_INDEX_CACHE_MEMORY_LIMIT, DEFAULT_MEM_TABLE_SIZE,
+    DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY, DEFAULT_VALUE_CACHE_MEMORY_LIMIT, DEFAULT_WAL_MAX_SIZE,
+};
 use crate::tree::{CompressionConfig, Compressor};
 use std::path::PathBuf;
 
@@ -19,7 +23,7 @@ use std::path::PathBuf;
 ///
 /// ## Bloom Filter Desired Error Probability
 /// - `bloom_filter_error_probability`: The desired error probability (eg. 0.05, 0.01)
-/// 
+///
 /// ## Caching Options
 /// - `enable_index_cache`: Whether to enable caching of SSTable indexes in memory
 /// - `enable_value_cache`: Whether to enable caching of frequently accessed values
@@ -31,7 +35,7 @@ use std::path::PathBuf;
 ///
 /// ## Memory Table Size
 /// Larger memory tables reduce I/O operations but use more RAM
-/// 
+///
 /// ## Index Cache
 /// Caching SSTable indexes improves read performance
 ///
@@ -52,7 +56,11 @@ pub struct TreeSettings {
     pub bloom_filter_error_probability: f64,
     pub enable_bloom_filter_cache: bool,
     pub enable_index_cache: bool,
+    pub index_cache_memory_limit: usize,
+    pub index_cache_max_capacity: usize,
     pub enable_value_cache: bool,
+    pub value_cache_memory_limit: usize,
+    pub value_cache_max_capacity: usize,
     pub enable_wal: bool,
     pub wal_max_size: u64,
     pub compressor: Compressor,
@@ -67,7 +75,11 @@ impl Default for TreeSettings {
             bloom_filter_error_probability: DEFAULT_BLOOM_FILTER_ERROR_PROBABILITY,
             enable_bloom_filter_cache: true,
             enable_index_cache: true,
+            index_cache_memory_limit: DEFAULT_INDEX_CACHE_MEMORY_LIMIT,
+            index_cache_max_capacity: DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY,
             enable_value_cache: true,
+            value_cache_memory_limit: DEFAULT_VALUE_CACHE_MEMORY_LIMIT,
+            value_cache_max_capacity: DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY,
             enable_wal: true,
             wal_max_size: DEFAULT_WAL_MAX_SIZE,
             compressor: Compressor::new(CompressionConfig::balanced()),
@@ -104,7 +116,11 @@ pub struct TreeSettingsBuilder {
     bloom_filter_error_probability: Option<f64>,
     enable_bloom_filter_cache: Option<bool>,
     enable_index_cache: Option<bool>,
+    index_cache_memory_limit: Option<usize>,
+    index_cache_max_capacity: Option<usize>,
     enable_value_cache: Option<bool>,
+    value_cache_memory_limit: Option<usize>,
+    value_cache_max_capacity: Option<usize>,
     enable_wal: Option<bool>,
     wal_max_size: Option<u64>,
     compressor: Option<Compressor>,
@@ -123,10 +139,14 @@ impl TreeSettingsBuilder {
             bloom_filter_error_probability: None,
             enable_bloom_filter_cache: None,
             enable_index_cache: None,
+            index_cache_memory_limit: None,
+            index_cache_max_capacity: None,
             enable_value_cache: None,
+            value_cache_memory_limit: None,
+            value_cache_max_capacity: None,
             enable_wal: None,
             wal_max_size: None,
-            compressor: None
+            compressor: None,
         }
     }
 
@@ -254,13 +274,108 @@ impl TreeSettingsBuilder {
         self
     }
 
+    /// Enables or disables Write-Ahead Logging (WAL).
+    ///
+    /// WAL provides durability guarantees by logging all write operations before
+    /// they are applied to the in-memory data structures. This ensures data recovery
+    /// in case of unexpected shutdowns or crashes.
+    ///
+    /// # Arguments
+    /// * `is_enabled` - `true` to enable WAL, `false` to disable
+    ///
+    /// # Returns
+    /// Self for method chaining
+    ///
+    /// # Performance Impact
+    /// - **Enabled**: Higher durability, slight write overhead
+    /// - **Disabled**: Better write performance, risk of data loss
+    ///
+    /// # Default
+    /// WAL is enabled by default for data safety.
     pub fn wal(mut self, is_enabled: bool) -> Self {
         self.enable_wal = Some(is_enabled);
         self
     }
 
+    /// Sets the maximum size for WAL segments before rotation.
+    ///
+    /// When a WAL segment reaches this size, the system will create a new segment
+    /// and eventually clean up old segments that are no longer needed for recovery.
+    /// This helps manage disk space and recovery time.
+    ///
+    /// # Arguments
+    /// * `size` - Maximum size in bytes for each WAL segment
+    ///
+    /// # Returns
+    /// Self for method chaining
+    ///
+    /// # Considerations
+    /// - **Larger sizes**: Fewer segment rotations, longer recovery time
+    /// - **Smaller sizes**: More frequent rotations, faster recovery
     pub fn wal_max_size(mut self, size: u64) -> Self {
         self.wal_max_size = Some(size);
+        self
+    }
+
+    /// Sets the memory limit for the index cache.
+    ///
+    /// The index cache stores SSTable index data in memory to speed up key lookups.
+    /// This setting controls the maximum amount of memory that can be used for
+    /// caching index data across all SSTable files.
+    ///
+    /// # Arguments
+    /// * `memory_limit` - Maximum memory usage in bytes for index cache
+    ///
+    /// # Returns
+    /// Self for method chaining
+    pub fn index_cache_memory_limit(mut self, memory_limit: usize) -> Self {
+        self.index_cache_memory_limit = Some(memory_limit);
+        self
+    }
+
+    /// Sets the maximum capacity (number of entries) for the index cache.
+    ///
+    /// This controls the maximum number of SSTable index entries that can be
+    /// stored in the cache simultaneously, regardless of their memory footprint.
+    ///
+    /// # Arguments
+    /// * `size` - Maximum number of index entries to cache
+    ///
+    /// # Returns
+    /// Self for method chaining
+    pub fn index_cache_max_capacity(mut self, size: usize) -> Self {
+        self.index_cache_max_capacity = Some(size);
+        self
+    }
+
+    /// Sets the memory limit for the value cache.
+    ///
+    /// The value cache stores frequently accessed data values in memory to improve
+    /// read performance. This setting controls the maximum amount of memory that
+    /// can be used for caching actual data values.
+    ///
+    /// # Arguments
+    /// * `memory_limit` - Maximum memory usage in bytes for value cache
+    ///
+    /// # Returns
+    /// Self for method chaining
+    pub fn value_cache_memory_limit(mut self, memory_limit: usize) -> Self {
+        self.value_cache_memory_limit = Some(memory_limit);
+        self
+    }
+
+    /// Sets the maximum capacity (number of entries) for the value cache.
+    ///
+    /// This controls the maximum number of data values that can be stored in the
+    /// cache simultaneously. Each entry represents one key-value pair.
+    ///
+    /// # Arguments
+    /// * `size` - Maximum number of values to cache
+    ///
+    /// # Returns
+    /// Self for method chaining
+    pub fn value_cache_max_capacity(mut self, size: usize) -> Self {
+        self.value_cache_max_capacity = Some(size);
         self
     }
 
@@ -297,21 +412,34 @@ impl TreeSettingsBuilder {
     /// A new TreeSettings instance
     pub fn build(self) -> TreeSettings {
         TreeSettings {
-            db_path: self
-                .db_path
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
+            db_path: self.db_path.unwrap_or(PathBuf::from(DEFAULT_DB_PATH)),
             bincode_config: self.bincode_config.unwrap_or(BINCODE_CONFIG),
             mem_table_max_size: self
                 .mem_table_max_size
                 .unwrap_or(DEFAULT_MEM_TABLE_SIZE as usize),
-            bloom_filter_error_probability: self.bloom_filter_error_probability
+            bloom_filter_error_probability: self
+                .bloom_filter_error_probability
                 .unwrap_or(DEFAULT_BLOOM_FILTER_ERROR_PROBABILITY),
             enable_bloom_filter_cache: self.enable_bloom_filter_cache.unwrap_or(true),
             enable_index_cache: self.enable_index_cache.unwrap_or(true),
+            index_cache_memory_limit: self
+                .index_cache_memory_limit
+                .unwrap_or(DEFAULT_INDEX_CACHE_MEMORY_LIMIT),
+            index_cache_max_capacity: self
+                .index_cache_max_capacity
+                .unwrap_or(DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY),
             enable_value_cache: self.enable_value_cache.unwrap_or(true),
+            value_cache_memory_limit: self
+                .value_cache_memory_limit
+                .unwrap_or(DEFAULT_VALUE_CACHE_MEMORY_LIMIT),
+            value_cache_max_capacity: self
+                .value_cache_max_capacity
+                .unwrap_or(DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY),
             enable_wal: self.enable_wal.unwrap_or(true),
             wal_max_size: self.wal_max_size.unwrap_or(DEFAULT_WAL_MAX_SIZE),
-            compressor: self.compressor.unwrap_or(Compressor::new(CompressionConfig::balanced())),
+            compressor: self
+                .compressor
+                .unwrap_or(Compressor::new(CompressionConfig::balanced())),
         }
     }
 }
