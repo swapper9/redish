@@ -1,7 +1,4 @@
-use crate::config::{
-    DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY, DEFAULT_INDEX_CACHE_MEMORY_LIMIT,
-    DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY, DEFAULT_VALUE_CACHE_MEMORY_LIMIT,
-};
+use crate::config::{BTREEMAP_U8_SIZE, DEFAULT_INDEX_CACHE_LRU_MAX_CAPACITY, DEFAULT_INDEX_CACHE_MEMORY_LIMIT, DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY, DEFAULT_VALUE_CACHE_MEMORY_LIMIT, VEC_U8_SIZE};
 use crate::tree::DataValue;
 use std::collections::BTreeMap;
 use std::collections::{HashMap, VecDeque};
@@ -401,10 +398,10 @@ impl LRUIndexCache {
         for (key, _) in index {
             size += key.len() + 8;
             size += key.capacity();
-            size += size_of::<Vec<u8>>();
+            size += VEC_U8_SIZE;
         }
         size += index.len() * 28;
-        size += size_of::<BTreeMap<Vec<u8>, u64>>();
+        size += BTREEMAP_U8_SIZE;
         size
     }
 

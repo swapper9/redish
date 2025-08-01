@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use bincode::config;
 use bincode::config::Configuration;
 
@@ -16,3 +17,5 @@ pub const DEFAULT_INDEX_CACHE_MEMORY_LIMIT: usize = 100 * 1024 * 1024;
 pub const DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY: usize = 200000;
 pub const DEFAULT_VALUE_CACHE_MEMORY_LIMIT: usize = 200 * 1024 * 1024;
 pub const CHECKPOINT_ENTRY_SIZE: usize = 19; //crc(4)+op(1)+key_len(4)+key(6)+value_len(4)
+pub const VEC_U8_SIZE: usize = size_of::<Vec<u8>>();
+pub const BTREEMAP_U8_SIZE: usize = size_of::<BTreeMap<Vec<u8>, u64>>();

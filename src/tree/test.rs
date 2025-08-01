@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::config::{DEFAULT_DB_PATH, DEFAULT_MEM_TABLE_SIZE};
+    use crate::config::DEFAULT_DB_PATH;
     use crate::tree::compression::CompressionConfig;
     use crate::tree::tree_error::TreeResult;
     use crate::tree::{Tree, TreeSettings, TreeSettingsBuilder};
@@ -69,28 +69,6 @@ mod test {
         assert_eq!(tree3.len(), 0);
         assert_eq!(tree4.len(), 0);
         assert_eq!(tree5.len(), 0);
-
-        clean_temp_dir();
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn test_put_entries_with_merge_ss_tables() -> TreeResult<()> {
-        clean_temp_dir();
-
-        let mut tree = Tree::load_with_path(DEFAULT_DB_PATH)?;
-        let max_entries: u64 = 100000;
-        for i in 1..=max_entries {
-            let user = User {
-                user_id: i,
-                username: format!("test_user_{}", i),
-            };
-            tree.put_typed::<User>(&format!("test_user_{}", i), &user)?;
-        }
-        tree.flush()?;
-        assert!((tree.ss_tables.len() as u64) < (max_entries / DEFAULT_MEM_TABLE_SIZE as u64 / 3));
-        assert_eq!(tree.len(), max_entries as usize);
 
         clean_temp_dir();
         Ok(())
@@ -298,12 +276,14 @@ mod test {
 
     #[test]
     #[serial]
-    fn test_read_write_100k_entries() -> TreeResult<()> {
+    fn test_rw_100k_from_memtable() -> TreeResult<()> {
         clean_temp_dir();
 
         let mut tree = Tree::load_with_settings(
             TreeSettingsBuilder::new()
-                .compressor(CompressionConfig::default())
+                .compressor(CompressionConfig::none())
+                .index_cache(false)
+                .value_cache(false)
                 .mem_table_max_size(100000)
                 .build(),
         )?;

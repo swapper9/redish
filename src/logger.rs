@@ -19,7 +19,7 @@ pub(crate) fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
     let log_dir = "logs";
     std::fs::create_dir_all(log_dir)?;
 
-    let pattern = "{d(%Y-%m-%d %H:%M:%S %Z)} | {h({l}):5.5} | {t} | {f}:{L} | {m}{n}";
+    let pattern = "{d(%Y-%m-%d %H:%M:%S%.3f %Z)} | {h({l}):5.5} | {t} | {f}:{L} | {m}{n}";
 
     let stdout = ConsoleAppender::builder()
         .encoder(Box::new(PatternEncoder::new(pattern)))
