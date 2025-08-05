@@ -39,6 +39,12 @@ pub enum TreeError {
 
     #[error("Internal error: {message}")]
     Internal { message: String },
+    
+    #[error("Transaction error: {message}")]   
+    Transaction { message: String },
+
+    #[error("SystemTime error: {message}")]
+    SystemTimeError { message: String },
 }
 
 impl TreeError {
@@ -107,6 +113,18 @@ impl TreeError {
             message: message.to_string(),
         }
     }
+
+    pub fn transaction<T: std::fmt::Display>(message: T) -> Self {
+        Self::Transaction {
+            message: message.to_string(),
+        }
+    }
+
+    pub fn system_time_error<T: std::fmt::Display>(message: T) -> Self {
+        Self::SystemTimeError {
+            message: message.to_string(),
+        }
+    }
 }
 
 impl From<bincode::error::EncodeError> for TreeError {
@@ -124,5 +142,11 @@ impl From<bincode::error::DecodeError> for TreeError {
 impl From<Box<dyn std::error::Error>> for TreeError {
     fn from(err: Box<dyn std::error::Error>) -> Self {
         TreeError::internal(format!("Boxed error: {}", err))
+    }
+}
+
+impl From<std::time::SystemTimeError> for TreeError {
+    fn from(err: std::time::SystemTimeError) -> Self {
+        TreeError::system_time_error(format!("SystemTimeError: {}", err))   
     }
 }

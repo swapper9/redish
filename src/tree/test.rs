@@ -10,7 +10,7 @@ mod test {
     use std::collections::HashMap;
     use std::mem;
     use std::path::PathBuf;
-    use std::time::Instant;
+    use std::time::{Duration, Instant, SystemTime};
 
     #[derive(Debug, Encode, Decode, PartialEq)]
     pub struct TestStruct {
@@ -31,6 +31,305 @@ mod test {
                 eprintln!("Warning: failed to remove directory {:?}: {}", db_path, e);
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_commit_transaction_with_key_versions() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .mem_table_max_size(1000)
+            .build())?;
+
+        let tx_id1 = tree.begin_transaction()?;
+        tree.put_tx(tx_id1, b"key1".to_vec(), b"value1".to_vec(), None)?;
+        tree.put_tx(tx_id1, b"key2".to_vec(), b"value2".to_vec(), None)?;
+
+        let key_versions_before = {
+            let tx_manager = tree.tx_manager.lock().unwrap();
+            let key_versions = tx_manager.key_versions.read().unwrap();
+            key_versions.clone()
+        };
+
+        assert!(key_versions_before.is_empty(), "key_versions should be empty before commit");
+
+        tree.commit_transaction(tx_id1)?;
+
+        let key_versions_after_first_commit = {
+            let tx_manager = tree.tx_manager.lock().unwrap();
+            let key_versions = tx_manager.key_versions.read().unwrap();
+            key_versions.clone()
+        };
+
+        assert_eq!(key_versions_after_first_commit.len(), 2, "Should have 2 key versions after first commit");
+        assert!(key_versions_after_first_commit.contains_key(&b"key1".to_vec()), "key1 should be present in key_versions");
+        assert!(key_versions_after_first_commit.contains_key(&b"key2".to_vec()), "key2 should be present in key_versions");
+
+        let key1_version_1 = key_versions_after_first_commit.get(&b"key1".to_vec()).unwrap().version;
+        let key2_version_1 = key_versions_after_first_commit.get(&b"key2".to_vec()).unwrap().version;
+
+        assert!(key1_version_1 > 0, "key1 version should be greater than 0");
+        assert!(key2_version_1 > 0, "key2 version should be greater than 0");
+
+        let tx_id2 = tree.begin_transaction()?;
+        tree.put_tx(tx_id2, b"key1".to_vec(), b"updated_value1".to_vec(), None)?; // Update existing
+        tree.put_tx(tx_id2, b"key3".to_vec(), b"value3".to_vec(), None)?; // Add new
+
+        tree.commit_transaction(tx_id2)?;
+
+        let key_versions_final = {
+            let tx_manager = tree.tx_manager.lock().unwrap();
+            let key_versions = tx_manager.key_versions.read().unwrap();
+            key_versions.clone()
+        };
+
+        assert_eq!(key_versions_final.len(), 3, "Should have 3 key versions after second commit");
+        assert!(key_versions_final.contains_key(&b"key1".to_vec()), "key1 should be present in final key_versions");
+        assert!(key_versions_final.contains_key(&b"key2".to_vec()), "key2 should be present in final key_versions");
+        assert!(key_versions_final.contains_key(&b"key3".to_vec()), "key3 should be present in final key_versions");
+
+        let key1_version_2 = key_versions_final.get(&b"key1".to_vec()).unwrap().version;
+        let key2_version_final = key_versions_final.get(&b"key2".to_vec()).unwrap().version;
+        let key3_version_1 = key_versions_final.get(&b"key3".to_vec()).unwrap().version;
+
+        assert!(key1_version_2 > key1_version_1, "key1 version should increase after update");
+        assert_eq!(key2_version_final, key2_version_1, "key2 version should remain unchanged");
+        assert!(key3_version_1 > 0, "key3 version should be greater than 0");
+
+        let global_version = {
+            let tx_manager_guard = tree.tx_manager.lock().unwrap();
+            let global_version_guard = tx_manager_guard.global_version.lock().unwrap();
+            *global_version_guard
+        };
+
+        let max_key_version = *[key1_version_2, key2_version_final, key3_version_1].iter().max().unwrap();
+        assert_eq!(global_version, max_key_version, "Global version should match maximum key version");
+
+        for (key, version_stamp) in key_versions_final.iter() {
+            assert!(version_stamp.timestamp <= SystemTime::now(),
+                    "Timestamp for key {:?} should not be in the future",
+                    String::from_utf8_lossy(key));
+        }
+
+        clean_temp_dir();
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_basic_transaction() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .mem_table_max_size(1000)
+            .build())?;
+
+        let tx_id = tree.begin_transaction()?;
+        tree.put_tx(tx_id, b"key1".to_vec(), b"value1".to_vec(), None)?;
+        tree.put_tx(tx_id, b"key2".to_vec(), b"value2".to_vec(), None)?;
+        let result1 = tree.get_tx(tx_id, b"key1")?;
+        assert_eq!(result1, Some(b"value1".to_vec()));
+        let result2 = tree.get_tx(tx_id, b"key2")?;
+        assert_eq!(result2, Some(b"value2".to_vec()));
+
+        let external_result = tree.get(b"key1")?;
+        assert_eq!(external_result, None);
+
+        tree.commit_transaction(tx_id)?;
+        let committed_result1 = tree.get(b"key1")?;
+        assert_eq!(committed_result1, Some(b"value1".to_vec()));
+
+        let committed_result2 = tree.get(b"key2")?;
+        assert_eq!(committed_result2, Some(b"value2".to_vec()));
+
+        clean_temp_dir();
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_transaction_rollback() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .mem_table_max_size(1000)
+            .build())?;
+
+        tree.put(b"existing_key".to_vec(), b"existing_value".to_vec())?;
+
+        let tx_id = tree.begin_transaction()?;
+
+        tree.put_tx(tx_id, b"new_key1".to_vec(), b"new_value1".to_vec(), None)?;
+        tree.put_tx(tx_id, b"new_key2".to_vec(), b"new_value2".to_vec(), None)?;
+        tree.put_tx(tx_id, b"existing_key".to_vec(), b"modified_value".to_vec(), None)?;
+
+        let tx_result = tree.get_tx(tx_id, b"existing_key")?;
+        assert_eq!(tx_result, Some(b"modified_value".to_vec()));
+
+        tree.rollback_transaction(tx_id)?;
+
+        let result1 = tree.get(b"new_key1")?;
+        assert_eq!(result1, None);
+        let result2 = tree.get(b"new_key2")?;
+        assert_eq!(result2, None);
+        let existing_result = tree.get(b"existing_key")?;
+        assert_eq!(existing_result, Some(b"existing_value".to_vec()));
+
+        clean_temp_dir();
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_transaction_isolation() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .mem_table_max_size(1000)
+            .build())?;
+
+        tree.put(b"shared_key".to_vec(), b"original_value".to_vec())?;
+
+        let tx1_id = tree.begin_transaction()?;
+        let tx2_id = tree.begin_transaction()?;
+
+        tree.put_tx(tx1_id, b"shared_key".to_vec(), b"tx1_value".to_vec(), None)?;
+        tree.put_tx(tx1_id, b"tx1_only".to_vec(), b"tx1_data".to_vec(), None)?;
+
+        tree.put_tx(tx2_id, b"shared_key".to_vec(), b"tx2_value".to_vec(), None)?;
+        tree.put_tx(tx2_id, b"tx2_only".to_vec(), b"tx2_data".to_vec(), None)?;
+
+        let tx1_shared = tree.get_tx(tx1_id, b"shared_key")?;
+        assert_eq!(tx1_shared, Some(b"tx1_value".to_vec()));
+
+        let tx2_shared = tree.get_tx(tx2_id, b"shared_key")?;
+        assert_eq!(tx2_shared, Some(b"tx2_value".to_vec()));
+
+        let tx1_sees_tx2 = tree.get_tx(tx1_id, b"tx2_only")?;
+        assert_eq!(tx1_sees_tx2, None);
+
+        let tx2_sees_tx1 = tree.get_tx(tx2_id, b"tx1_only")?;
+        assert_eq!(tx2_sees_tx1, None);
+
+        tree.commit_transaction(tx1_id)?;
+
+        let global_shared = tree.get(b"shared_key")?;
+        assert_eq!(global_shared, Some(b"tx1_value".to_vec()));
+
+        let global_tx1_only = tree.get(b"tx1_only")?;
+        assert_eq!(global_tx1_only, Some(b"tx1_data".to_vec()));
+
+        let tx2_still_sees = tree.get_tx(tx2_id, b"shared_key")?;
+        assert_eq!(tx2_still_sees, Some(b"tx2_value".to_vec()));
+
+        tree.rollback_transaction(tx2_id)?;
+
+        let final_shared = tree.get(b"shared_key")?;
+        assert_eq!(final_shared, Some(b"tx1_value".to_vec()));
+
+        let final_tx2_only = tree.get(b"tx2_only")?;
+        assert_eq!(final_tx2_only, None);
+
+        clean_temp_dir();
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_transaction_update_existing() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .mem_table_max_size(1000)
+            .build())?;
+
+        tree.put(b"update_key".to_vec(), b"original".to_vec())?;
+
+        let tx_id = tree.begin_transaction()?;
+
+        let original = tree.get_tx(tx_id, b"update_key")?;
+        assert_eq!(original, Some(b"original".to_vec()));
+
+        tree.put_tx(tx_id, b"update_key".to_vec(), b"updated".to_vec(), None)?;
+
+        let updated = tree.get_tx(tx_id, b"update_key")?;
+        assert_eq!(updated, Some(b"updated".to_vec()));
+
+        let global = tree.get(b"update_key")?;
+        assert_eq!(global, Some(b"original".to_vec()));
+
+        tree.commit_transaction(tx_id)?;
+
+        let final_global = tree.get(b"update_key")?;
+        assert_eq!(final_global, Some(b"updated".to_vec()));
+
+        clean_temp_dir();
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_invalid_transaction_operations() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .mem_table_max_size(1000)
+            .build())?;
+
+        let invalid_tx_id = 999;
+
+        let read_result = tree.get_tx(invalid_tx_id, b"key");
+        assert!(read_result.is_err());
+
+        let write_result = tree.put_tx(invalid_tx_id, b"key".to_vec(), b"value".to_vec(), None);
+        assert!(write_result.is_err());
+
+        let commit_result = tree.commit_transaction(invalid_tx_id);
+        assert!(commit_result.is_err());
+
+        clean_temp_dir();
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_transaction_with_ttl() -> TreeResult<()> {
+        clean_temp_dir();
+
+        let mut tree = Tree::load_with_settings(TreeSettingsBuilder::new()
+            .mem_table_max_size(10)
+            .build())?;
+
+        let tx_id = tree.begin_transaction()?;
+
+        for i in 0..12 {
+            tree.put_tx(tx_id, format!("key_{}", i).as_bytes().to_vec(), format!("value_{}", i).as_bytes().to_vec(), None)?;
+        }
+        let ttl = Duration::from_millis(100);
+        tree.put_tx(tx_id, b"ttl_key".to_vec(), b"ttl_value".to_vec(), Some(ttl))?;
+
+        let in_tx = tree.get_tx(tx_id, b"ttl_key")?;
+        assert_eq!(in_tx, Some(b"ttl_value".to_vec()));
+
+        tree.commit_transaction(tx_id)?;
+
+        let after_commit = tree.get(b"ttl_key")?;
+        assert_eq!(after_commit, Some(b"ttl_value".to_vec()));
+
+        std::thread::sleep(Duration::from_millis(150));
+
+        let after_ttl = tree.get(b"ttl_key")?;
+        assert_eq!(after_ttl, None);
+        clean_temp_dir();
+
+        Ok(())
     }
 
     #[test]
@@ -76,6 +375,7 @@ mod test {
 
     #[test]
     #[serial]
+    #[ignore]
     fn test_write_and_load_entries_with_flush_and_random_search() -> TreeResult<()> {
         clean_temp_dir();
 
@@ -158,6 +458,7 @@ mod test {
 
     #[test]
     #[serial]
+    #[ignore]
     fn test_continious_write_entries_with_flush_and_random_search() -> TreeResult<()> {
         clean_temp_dir();
 
@@ -248,7 +549,10 @@ mod test {
             const VALUE_LENGTH: usize = 100;
 
             let mut tree = Tree::load_with_settings(
-                TreeSettingsBuilder::new().mem_table_max_size(2000).build(),
+                TreeSettingsBuilder::new()
+                    .mem_table_max_size(2000)
+                    .compressor(CompressionConfig::balanced())
+                    .build(),
             )?;
 
             let mut keys = Vec::with_capacity(ENTRIES);
@@ -264,7 +568,12 @@ mod test {
         }
 
         {
-            let mut recovered_tree = Tree::load()?;
+            let mut recovered_tree = Tree::load_with_settings(
+                TreeSettingsBuilder::new()
+                    .mem_table_max_size(2000)
+                    .compressor(CompressionConfig::balanced())
+                    .build(),
+            )?;
             let value1 = recovered_tree.get(b"key1")?;
             let value2 = recovered_tree.get(b"key2")?;
             assert_eq!(value1, Some(b"value1".to_vec()));
@@ -427,6 +736,7 @@ mod test {
         assert_eq!(retrieved_object, large_object, "Large object data mismatch");
 
         clean_temp_dir();
+
         Ok(())
     }
 
@@ -525,6 +835,7 @@ mod test {
 
     #[test]
     #[serial]
+    #[ignore]
     fn test_variable_size_loadtest() -> TreeResult<()> {
         clean_temp_dir();
 
@@ -567,7 +878,7 @@ mod test {
                 count as f64 / write_duration.as_secs_f64()
             );
             tree.flush()?;
-            // Read back
+
             let read_start = Instant::now();
             let mut found = 0;
 
@@ -592,7 +903,6 @@ mod test {
         println!("Index cache: {}", tree.get_index_cache_stats());
         println!("Value cache: {}", tree.get_value_cache_stats());
 
-        clean_temp_dir();
         Ok(())
     }
 

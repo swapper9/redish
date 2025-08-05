@@ -4,6 +4,8 @@ pub mod data_value;
 pub mod settings;
 mod sstable;
 mod test;
+mod transaction;
+mod transaction_manager;
 mod tree_error;
 mod wal;
 mod wal_reader;
@@ -15,6 +17,7 @@ pub use data_value::*;
 pub use settings::*;
 
 use crate::config::DEFAULT_DB_PATH;
+use crate::tree::transaction_manager::TransactionManager;
 use crate::tree::tree_error::{TreeError, TreeResult};
 use crate::tree::wal::WalOperation;
 use crate::tree::wal_writer::WalWriter;
@@ -25,7 +28,7 @@ use log::{error, warn};
 use once_cell::sync::Lazy;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -49,6 +52,7 @@ pub struct Tree {
     wal_writer: Option<WalWriter>,
     wal_segments: Vec<u16>,
     cleanup_sender: Option<mpsc::Sender<u16>>,
+    tx_manager: Arc<Mutex<TransactionManager>>,
 }
 
 impl Drop for Tree {
@@ -91,6 +95,7 @@ impl Tree {
             wal_writer: None,
             wal_segments: Vec::new(),
             cleanup_sender: Some(cleanup_sender),
+            tx_manager: Arc::new(Mutex::new(TransactionManager::new())),
         };
 
         if tree.settings.enable_wal {

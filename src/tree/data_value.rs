@@ -7,6 +7,7 @@ pub struct DataValue {
     pub expires_at: Option<SystemTime>,
     pub created_at: SystemTime,
     pub is_tombstone: bool,
+    pub transaction_id: Option<u64>,
 }
 
 impl DataValue {
@@ -27,6 +28,7 @@ impl DataValue {
             expires_at,
             created_at,
             is_tombstone: false,
+            transaction_id: None,       
         }
     }
 
@@ -53,6 +55,7 @@ impl DataValue {
             expires_at: None,
             created_at: SystemTime::now(),
             is_tombstone: false,
+            transaction_id: None,
         }
     }
 
@@ -97,6 +100,7 @@ impl DataValue {
             expires_at: None,
             created_at: SystemTime::now(),
             is_tombstone: true,
+            transaction_id: None,
         }
     }
 

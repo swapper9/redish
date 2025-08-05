@@ -9,6 +9,7 @@ A lightweight in-memory key-value storage DB created based on LSM Tree.
 - TTL support for keys
 - Persistence with sstable auto-merge
 - Write-ahead log (WAL)
+- Optimistic transaction management
 - Bloom filter with optional caching
 - Optional index caching
 - Optional value caching
@@ -17,9 +18,9 @@ A lightweight in-memory key-value storage DB created based on LSM Tree.
 Default settings are:
 - WAL on
 - bloom filter on
-- index caching on (100Mb cache)
+- index caching on (100Mb cache, 100 entries/sstables)
 - value caching on (200Mb cache, 200k values)
-- compression on (LZ4 level 1, "balanced")
+- compression off
 All these settings could be altered via TreeSettingsBuilder.
 
 ## Usage:
@@ -43,7 +44,7 @@ let mut tree = Tree::load()?;
 let mut tree2 = Tree::load_with_path("/path/to/db/with_file_name")?;
 
 
-tree.put("key1".to_string().into_bytes(), "value".to_string().into_bytes())?;
+tree.put(b"key1".to_string().into_bytes(), "value".to_string().into_bytes())?;
 tree.put_with_ttl("key2".to_string().into_bytes(), "value".to_string().into_bytes(), Some(Duration::from_secs(60)))?;
 
 // type-friendly usage with turbo-fish
@@ -62,4 +63,13 @@ let tree = Tree::load_with_settings(
                 .compressor(CompressionConfig::best())
                 .build()
         )?;
+```
+### Using transactions:
+```
+let tx_id1 = tree.begin_transaction()?;
+let tx_id2 = tree.begin_transaction()?;
+tree.put_tx(tx_id1, b"key1".to_vec(), b"JohnDoe".to_vec(), None)?;
+tree.put_tx(tx_id2, b"key_to_rollback".to_vec(), b"NotJohnDoe".to_vec(), None)?;
+tree.commit_transaction(tx_id1)?;
+tree.rollback_transaction(tx_id2)?;
 ```

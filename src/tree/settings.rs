@@ -82,7 +82,7 @@ impl Default for TreeSettings {
             value_cache_max_capacity: DEFAULT_VALUE_CACHE_LRU_MAX_CAPACITY,
             enable_wal: true,
             wal_max_size: DEFAULT_WAL_MAX_SIZE,
-            compressor: Compressor::new(CompressionConfig::balanced()),
+            compressor: Compressor::new(CompressionConfig::none()),
         }
     }
 }
@@ -439,7 +439,7 @@ impl TreeSettingsBuilder {
             wal_max_size: self.wal_max_size.unwrap_or(DEFAULT_WAL_MAX_SIZE),
             compressor: self
                 .compressor
-                .unwrap_or(Compressor::new(CompressionConfig::balanced())),
+                .unwrap_or(Compressor::new(CompressionConfig::none())),
         }
     }
 }
